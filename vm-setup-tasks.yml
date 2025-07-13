@@ -1,0 +1,204 @@
+---
+- name: "Processing VM: {{ vm_config.name }}"
+  debug:
+    msg: "Starting setup for {{ vm_config.name }} with IP {{ vm_config.final_ip }}"
+
+- name: Clone VM on VirtualBox host
+  delegate_to: "{{ vbox_host }}"
+  vars:
+    ansible_user: "{{ vbox_user }}"
+    vm_destination_path: "/data/VirtualBoxVMs/cluster"
+  block:
+    - name: Check if VM already exists
+      command: VBoxManage list vms
+      register: existing_vms
+
+    - name: Remove existing VM if present
+      block:
+        - name: Power off existing VM
+          command: VBoxManage controlvm "{{ vm_config.name }}" poweroff
+          ignore_errors: yes
+
+        - name: Wait for shutdown
+          pause:
+            seconds: 10
+
+        - name: Unregister and delete existing VM
+          command: VBoxManage unregistervm "{{ vm_config.name }}" --delete
+          ignore_errors: yes
+
+      when: vm_config.name in existing_vms.stdout
+
+    - name: Clone the base VM
+      command: VBoxManage clonevm "{{ source_vm }}" --name "{{ vm_config.name }}" --register --basefolder "{{ vm_destination_path }}"
+      register: clone_result
+
+    - name: Start the cloned VM
+      command: VBoxManage startvm "{{ vm_config.name }}" --type headless
+
+    - name: Wait for VM to boot and be accessible
+      wait_for:
+        host: "{{ initial_ip }}"
+        port: 22
+        delay: 30
+        timeout: 300
+
+- name: Configure VM with initial IP
+  delegate_to: "{{ initial_ip }}"
+  vars:
+    ansible_user: "{{ template_user }}"
+  become: yes
+  block:
+    - name: Wait for system to be ready
+      wait_for_connection:
+        connect_timeout: 20
+        sleep: 5
+        delay: 5
+        timeout: 180
+
+    - name: Create ubuntu user
+      user:
+        name: "{{ final_user }}"
+        shell: /bin/bash
+        create_home: yes
+        home: "/home/{{ final_user }}"
+        state: present
+        groups: sudo
+        append: yes
+
+    - name: Create .ssh directory for ubuntu user
+      file:
+        path: "/home/{{ final_user }}/.ssh"
+        state: directory
+        owner: "{{ final_user }}"
+        group: "{{ final_user }}"
+        mode: '0700'
+
+    - name: Copy SSH keys from anandy to ubuntu
+      copy:
+        src: "/home/{{ template_user }}/.ssh/"
+        dest: "/home/{{ final_user }}/.ssh/"
+        owner: "{{ final_user }}"
+        group: "{{ final_user }}"
+        mode: preserve
+        remote_src: yes
+
+    - name: Set proper permissions for SSH files
+      file:
+        path: "/home/{{ final_user }}/.ssh/{{ item.file }}"
+        mode: "{{ item.mode }}"
+        owner: "{{ final_user }}"
+        group: "{{ final_user }}"
+      loop:
+        - { file: 'authorized_keys', mode: '0600' }
+        - { file: 'id_rsa', mode: '0600' }
+        - { file: 'id_rsa.pub', mode: '0644' }
+      ignore_errors: yes
+
+    - name: Create sudoers file for ubuntu user
+      copy:
+        content: "{{ final_user }} ALL=(ALL:ALL) NOPASSWD: ALL\n"
+        dest: "/etc/sudoers.d/{{ final_user }}"
+        owner: root
+        group: root
+        mode: '0440'
+        validate: 'visudo -cf %s'
+
+    - name: Update netplan configuration with new IP
+      template:
+        src: netplan.j2
+        dest: /etc/netplan/50-cloud-init.yaml
+        owner: root
+        group: root
+        mode: '0644'
+        backup: yes
+      vars:
+        primary_ip: "{{ vm_config.final_ip }}"
+
+    - name: Apply netplan configuration
+      command: netplan apply
+
+    - name: Set hostname
+      hostname:
+        name: "{{ vm_config.hostname }}"
+
+    - name: Update /etc/hostname
+      copy:
+        content: "{{ vm_config.hostname }}"
+        dest: /etc/hostname
+        owner: root
+        group: root
+        mode: '0644'
+
+- name: Restart VM to ensure all changes take effect
+  delegate_to: "{{ vbox_host }}"
+  vars:
+    ansible_user: "{{ vbox_user }}"
+  block:
+    - name: Shutdown VM gracefully
+      command: VBoxManage controlvm "{{ vm_config.name }}" acpipowerbutton
+      ignore_errors: yes
+
+    - name: Wait for shutdown
+      pause:
+        seconds: 30
+
+    - name: Force shutdown if needed
+      command: VBoxManage controlvm "{{ vm_config.name }}" poweroff
+      ignore_errors: yes
+
+    - name: Start VM with new configuration
+      command: VBoxManage startvm "{{ vm_config.name }}" --type headless
+
+    - name: Wait for VM to be accessible on new IP
+      wait_for:
+        host: "{{ vm_config.final_ip }}"
+        port: 22
+        delay: 30
+        timeout: 300
+
+- name: Final configuration with new IP
+  delegate_to: "{{ vm_config.final_ip }}"
+  vars:
+    ansible_user: "{{ final_user }}"
+  become: yes
+  block:
+    - name: Wait for system to be ready
+      wait_for_connection:
+        connect_timeout: 20
+        sleep: 5
+        delay: 5
+        timeout: 180
+
+    - name: Remove old IP (192.168.1.205) from netplan
+      template:
+        src: netplan-final.j2
+        dest: /etc/netplan/50-cloud-init.yaml
+        owner: root
+        group: root
+        mode: '0644'
+        backup: yes
+      vars:
+        primary_ip: "{{ vm_config.final_ip }}"
+
+    - name: Apply final netplan configuration
+      command: netplan apply
+
+    - name: Update /etc/hosts with all VM entries
+      blockinfile:
+        path: /etc/hosts
+        block: "{{ hosts_entries }}"
+        marker: "# {mark} ANSIBLE MANAGED VM HOSTS"
+        backup: yes
+
+    - name: Verify final configuration
+      command: ip addr show
+      register: final_ip_config
+
+    - name: Display final IP configuration
+      debug:
+        msg: "{{ vm_config.name }} configured with IP {{ vm_config.final_ip }}"
+
+- name: VM setup complete
+  debug:
+    msg: "Successfully configured {{ vm_config.name }} with IP {{ vm_config.final_ip }}"

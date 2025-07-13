@@ -1,0 +1,64 @@
+---
+- name: Create VM cluster with comprehensive error handling
+  hosts: localhost
+  gather_facts: no
+  vars:
+    source_vm: "ubuntu-base"
+    vbox_host: "192.168.1.200"
+    vbox_user: "anandy"
+    initial_ip: "192.168.1.205"
+    template_user: "anandy"
+    final_user: "ubuntu"
+    vm_configs:
+      - { name: "ub-server-01", final_ip: "192.168.1.190", hostname: "master" }
+      - { name: "ub-server-02", final_ip: "192.168.1.191", hostname: "worker1" }
+      - { name: "ub-server-03", final_ip: "192.168.1.192", hostname: "worker2" }
+      - { name: "ub-server-04", final_ip: "192.168.1.193", hostname: "worker3" }
+      - { name: "ub-server-05", final_ip: "192.168.1.194", hostname: "worker4" }
+    hosts_entries: |
+      192.168.1.190 master ub-server-01
+      192.168.1.191 worker1 ub-server-02
+      192.168.1.192 worker2 ub-server-03
+      192.168.1.193 worker3 ub-server-04
+      192.168.1.194 worker4 ub-server-05
+
+  tasks:
+    - name: Validate VirtualBox host connectivity
+      delegate_to: "{{ vbox_host }}"
+      vars:
+        ansible_user: "{{ vbox_user }}"
+      ping:
+
+    - name: Check if source VM exists
+      delegate_to: "{{ vbox_host }}"
+      vars:
+        ansible_user: "{{ vbox_user }}"
+      command: VBoxManage list vms
+      register: source_vm_check
+
+    - name: Fail if source VM doesn't exist
+      fail:
+        msg: "Source VM '{{ source_vm }}' not found on VirtualBox host"
+      when: source_vm not in source_vm_check.stdout
+
+    - name: Create VMs sequentially
+      include_tasks: vm-setup-tasks.yml
+      loop: "{{ vm_configs }}"
+      loop_control:
+        loop_var: vm_config
+
+    - name: Final verification - Test all VMs
+      delegate_to: "{{ item.final_ip }}"
+      vars:
+        ansible_user: "{{ final_user }}"
+      ping:
+      loop: "{{ vm_configs }}"
+
+    - name: Display completion summary
+      debug:
+        msg: |
+          VM Cluster Setup Complete!
+          Created VMs:
+          {% for vm in vm_configs %}
+          - {{ vm.name }} ({{ vm.hostname }}) - {{ vm.final_ip }}
+          {% endfor %}
