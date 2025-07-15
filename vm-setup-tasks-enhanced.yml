@@ -1,13 +1,16 @@
+
 ---
-- name: "Processing VM: {{ vm_config.name }}"
+- name: "=== Processing VM {{ vm_index + 1 }}/{{ vm_configs | length }}: {{ vm_config.name }} ==="
   debug:
-    msg: "Starting setup for {{ vm_config.name }} with IP {{ vm_config.final_ip }}"
+    msg: |
+      Starting setup for {{ vm_config.name }}
+      Target IP: {{ vm_config.final_ip }}
+      Hostname: {{ vm_config.hostname }}
 
 - name: Clone VM on VirtualBox host
   delegate_to: "{{ vbox_host }}"
   vars:
     ansible_user: "{{ vbox_user }}"
-    vm_destination_path: "/data/VirtualBoxVMs/cluster"
   block:
     - name: Check if VM already exists
       command: VBoxManage list vms
@@ -15,6 +18,10 @@
 
     - name: Remove existing VM if present
       block:
+        - name: Display cleanup message
+          debug:
+            msg: "VM {{ vm_config.name }} already exists. Cleaning up..."
+
         - name: Power off existing VM
           command: VBoxManage controlvm "{{ vm_config.name }}" poweroff
           ignore_errors: yes
@@ -27,14 +34,27 @@
           command: VBoxManage unregistervm "{{ vm_config.name }}" --delete
           ignore_errors: yes
 
+        - name: Confirm cleanup
+          debug:
+            msg: "Cleanup completed for {{ vm_config.name }}"
+
       when: vm_config.name in existing_vms.stdout
 
     - name: Clone the base VM
-      command: VBoxManage clonevm "{{ source_vm }}" --name "{{ vm_config.name }}" --register --basefolder "{{ vm_destination_path }}"
+      command: VBoxManage clonevm "{{ source_vm }}" --name "{{ vm_config.name }}" --register --basefolder "{{ vm_destination }}"
       register: clone_result
+
+    - name: Display clone result
+      debug:
+        msg: "Successfully cloned {{ source_vm }} to {{ vm_config.name }}"
 
     - name: Start the cloned VM
       command: VBoxManage startvm "{{ vm_config.name }}" --type headless
+      register: start_result
+
+    - name: Display start result
+      debug:
+        msg: "VM {{ vm_config.name }} started successfully"
 
     - name: Wait for VM to boot and be accessible
       wait_for:
@@ -42,6 +62,11 @@
         port: 22
         delay: 30
         timeout: 300
+      register: vm_boot_wait
+
+    - name: Display boot confirmation
+      debug:
+        msg: "VM {{ vm_config.name }} is now accessible on {{ initial_ip }}"
 
 - name: Configure VM with initial IP
   delegate_to: "{{ initial_ip }}"
@@ -56,6 +81,11 @@
         delay: 5
         timeout: 180
 
+    - name: Check if ubuntu user already exists
+      command: id "{{ final_user }}"
+      register: user_check
+      failed_when: false
+
     - name: Create ubuntu user
       user:
         name: "{{ final_user }}"
@@ -65,6 +95,11 @@
         state: present
         groups: sudo
         append: yes
+      when: user_check.rc != 0
+
+    - name: Display user creation result
+      debug:
+        msg: "User {{ final_user }} {{ 'already exists' if user_check.rc == 0 else 'created successfully' }}"
 
     - name: Create .ssh directory for ubuntu user
       file:
@@ -130,11 +165,19 @@
         group: root
         mode: '0644'
 
+    - name: Display initial configuration complete
+      debug:
+        msg: "Initial configuration completed for {{ vm_config.name }}"
+
 - name: Restart VM to ensure all changes take effect
   delegate_to: "{{ vbox_host }}"
   vars:
     ansible_user: "{{ vbox_user }}"
   block:
+    - name: Display restart message
+      debug:
+        msg: "Restarting {{ vm_config.name }} to apply all changes..."
+
     - name: Shutdown VM gracefully
       command: VBoxManage controlvm "{{ vm_config.name }}" acpipowerbutton
       ignore_errors: yes
@@ -156,6 +199,10 @@
         port: 22
         delay: 30
         timeout: 300
+
+    - name: Display restart complete
+      debug:
+        msg: "{{ vm_config.name }} restarted and accessible on {{ vm_config.final_ip }}"
 
 - name: Final configuration with new IP
   delegate_to: "{{ vm_config.final_ip }}"
@@ -197,8 +244,12 @@
 
     - name: Display final IP configuration
       debug:
-        msg: "{{ vm_config.name }} configured with IP {{ vm_config.final_ip }}"
+        msg: |
+          {{ vm_config.name }} final configuration:
+          - Hostname: {{ vm_config.hostname }}
+          - IP Address: {{ vm_config.final_ip }}
+          - Status: Ready for use
 
 - name: VM setup complete
   debug:
-    msg: "Successfully configured {{ vm_config.name }} with IP {{ vm_config.final_ip }}"
+    msg: "✅ Successfully configured {{ vm_config.name }} ({{ vm_config.hostname }}) with IP {{ vm_config.final_ip }}"

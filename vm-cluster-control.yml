@@ -1,0 +1,185 @@
+---
+- name: Control VM Cluster (Start/Stop/Status)
+  hosts: localhost
+  gather_facts: yes
+  vars:
+    vbox_host: "192.168.1.200"
+    vbox_user: "anandy"
+    action: "{{ vm_action | default('status') }}"  # start, stop, status, restart
+    vm_configs:
+      - { name: "ub-server-01", ip: "192.168.1.190", hostname: "master", role: "master" }
+      - { name: "ub-server-02", ip: "192.168.1.191", hostname: "worker1", role: "worker" }
+      - { name: "ub-server-03", ip: "192.168.1.192", hostname: "worker2", role: "worker" }
+      - { name: "ub-server-04", ip: "192.168.1.193", hostname: "worker3", role: "worker" }
+      - { name: "ub-server-05", ip: "192.168.1.194", hostname: "worker4", role: "worker" }
+
+  tasks:
+    - name: Display action being performed
+      debug:
+        msg: |
+          VM Cluster Control
+          ==================
+          Action: {{ action | upper }}
+          VirtualBox Host: {{ vbox_host }}
+          VMs to process: {{ vm_configs | length }}
+
+    - name: Validate action parameter
+      fail:
+        msg: "Invalid action '{{ action }}'. Valid actions are: start, stop, status, restart"
+      when: action not in ['start', 'stop', 'status', 'restart']
+
+    - name: Get current VM status
+      delegate_to: "{{ vbox_host }}"
+      vars:
+        ansible_user: "{{ vbox_user }}"
+      command: VBoxManage list runningvms
+      register: running_vms
+
+    - name: Get all VMs status
+      delegate_to: "{{ vbox_host }}"
+      vars:
+        ansible_user: "{{ vbox_user }}"
+      command: VBoxManage list vms
+      register: all_vms
+
+    - name: Display current status
+      debug:
+        msg: |
+          Current VM Status:
+          {% for vm in vm_configs %}
+          - {{ vm.name }} ({{ vm.hostname }}): {{ 'RUNNING' if vm.name in running_vms.stdout else 'STOPPED' if vm.name in all_vms.stdout else 'NOT FOUND' }}
+          {% endfor %}
+
+    # Stop VMs block - only runs when action is stop or restart
+    - name: Stop running VMs gracefully
+      delegate_to: "{{ vbox_host }}"
+      vars:
+        ansible_user: "{{ vbox_user }}"
+      command: VBoxManage controlvm "{{ item.name }}" acpipowerbutton
+      loop: "{{ vm_configs }}"
+      when:
+        - action in ['stop', 'restart']
+        - item.name in running_vms.stdout
+      ignore_errors: yes
+
+    - name: Wait for graceful shutdown
+      pause:
+        seconds: 30
+        prompt: "Waiting for VMs to shutdown gracefully..."
+      when:
+        - action in ['stop', 'restart']
+        - vm_configs | selectattr('name', 'in', running_vms.stdout) | list | length > 0
+
+    - name: Force stop any remaining VMs
+      delegate_to: "{{ vbox_host }}"
+      vars:
+        ansible_user: "{{ vbox_user }}"
+      command: VBoxManage controlvm "{{ item.name }}" poweroff
+      loop: "{{ vm_configs }}"
+      when:
+        - action in ['stop', 'restart']
+        - item.name in running_vms.stdout
+      ignore_errors: yes
+
+    - name: Display stop completion
+      debug:
+        msg: "VM stop operation completed"
+      when: action in ['stop', 'restart']
+
+    # Start VMs block - only runs when action is start or restart
+    - name: Start VMs in sequence (master first)
+      delegate_to: "{{ vbox_host }}"
+      vars:
+        ansible_user: "{{ vbox_user }}"
+      command: VBoxManage startvm "{{ item.name }}" --type headless
+      loop: "{{ vm_configs | sort(attribute='role', reverse=true) }}"
+      when:
+        - action in ['start', 'restart']
+        - item.name in all_vms.stdout
+      register: start_results
+      ignore_errors: yes
+
+    - name: Wait between VM starts
+      pause:
+        seconds: 10
+      when:
+        - action in ['start', 'restart']
+        - vm_configs | length > 1
+
+    - name: Display start results
+      debug:
+        msg: |
+          VM Start Results:
+          {% for result in start_results.results %}
+          - {{ vm_configs[loop.index0].name }}: {{ 'SUCCESS' if result.rc == 0 else 'FAILED' }}
+          {% endfor %}
+      when: action in ['start', 'restart']
+
+    - name: Wait for VMs to be accessible
+      wait_for:
+        host: "{{ item.ip }}"
+        port: 22
+        delay: 30
+        timeout: 300
+      loop: "{{ vm_configs }}"
+      when:
+        - action in ['start', 'restart']
+        - item.name in all_vms.stdout
+      ignore_errors: yes
+      register: connectivity_check
+
+    - name: Display connectivity results
+      debug:
+        msg: |
+          VM Connectivity Check:
+          {% for result in connectivity_check.results %}
+          {% if not result.skipped %}
+          - {{ vm_configs[loop.index0].name }} ({{ vm_configs[loop.index0].ip }}): {{ 'ACCESSIBLE' if not result.failed else 'NOT ACCESSIBLE' }}
+          {% endif %}
+          {% endfor %}
+      when: action in ['start', 'restart']
+
+    - name: Get final VM status
+      delegate_to: "{{ vbox_host }}"
+      vars:
+        ansible_user: "{{ vbox_user }}"
+      command: VBoxManage list runningvms
+      register: final_running_vms
+
+    - name: Display final status header
+      debug:
+        msg:
+          - "Final VM Status:"
+          - "================"
+
+    - name: Display VM status
+      debug:
+        msg: "{{ item.name }} ({{ item.hostname }}) [{{ item.ip }}]: {{ 'RUNNING' if item.name in final_running_vms.stdout else 'STOPPED' }}"
+      loop: "{{ vm_configs }}"
+
+    - name: Display status summary
+      debug:
+        msg:
+          - ""
+          - "Summary:"
+          - "- Running VMs: {{ vm_configs | selectattr('name', 'in', final_running_vms.stdout) | list | length }}"
+          - "- Stopped VMs: {{ vm_configs | length - (vm_configs | selectattr('name', 'in', final_running_vms.stdout) | list | length) }}"
+
+
+    - name: Save VM status to file
+      copy:
+        content: |
+          VM Cluster Status Report
+          Generated: {{ ansible_date_time.iso8601 }}
+          Action Performed: {{ action | upper }}
+          
+          {% for vm in vm_configs %}
+          {{ vm.name }}:
+            hostname: {{ vm.hostname }}
+            ip: {{ vm.ip }}
+            role: {{ vm.role }}
+            status: {{ 'RUNNING' if vm.name in final_running_vms.stdout else 'STOPPED' }}
+            ssh: ssh ubuntu@{{ vm.ip }}
+          {% endfor %}
+        dest: "./vm-cluster-status.txt"
+        mode: '0644'

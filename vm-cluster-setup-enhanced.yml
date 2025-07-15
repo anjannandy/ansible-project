@@ -9,6 +9,7 @@
     initial_ip: "192.168.1.205"
     template_user: "anandy"
     final_user: "ubuntu"
+    vm_destination: "/home/anandy/VirtualBox VMs"
     vm_configs:
       - { name: "ub-server-01", final_ip: "192.168.1.190", hostname: "master" }
       - { name: "ub-server-02", final_ip: "192.168.1.191", hostname: "worker1" }
@@ -23,11 +24,46 @@
       192.168.1.194 worker4 ub-server-05
 
   tasks:
+    - name: Display start message
+      debug:
+        msg: |
+          Starting VM Cluster Setup
+          =========================
+          Source VM: {{ source_vm }}
+          VirtualBox Host: {{ vbox_host }}
+          VMs to create: {{ vm_configs | length }}
+          Destination: {{ vm_destination }}
+
     - name: Validate VirtualBox host connectivity
       delegate_to: "{{ vbox_host }}"
       vars:
         ansible_user: "{{ vbox_user }}"
       ping:
+      register: vbox_ping
+      failed_when: false
+
+    - name: Fail if VirtualBox host is unreachable
+      fail:
+        msg: "Cannot connect to VirtualBox host {{ vbox_host }}"
+      when: vbox_ping.failed
+
+    - name: Check VirtualBox installation
+      delegate_to: "{{ vbox_host }}"
+      vars:
+        ansible_user: "{{ vbox_user }}"
+      command: VBoxManage --version
+      register: vbox_version
+      failed_when: false
+
+    - name: Display VirtualBox version
+      debug:
+        msg: "VirtualBox version: {{ vbox_version.stdout }}"
+      when: not vbox_version.failed
+
+    - name: Fail if VirtualBox is not installed
+      fail:
+        msg: "VirtualBox is not installed or not accessible on {{ vbox_host }}"
+      when: vbox_version.failed
 
     - name: Check if source VM exists
       delegate_to: "{{ vbox_host }}"
@@ -41,11 +77,32 @@
         msg: "Source VM '{{ source_vm }}' not found on VirtualBox host"
       when: source_vm not in source_vm_check.stdout
 
+    - name: Display source VM confirmation
+      debug:
+        msg: "Source VM '{{ source_vm }}' found and ready for cloning"
+
+    - name: Ensure VM destination directory exists
+      delegate_to: "{{ vbox_host }}"
+      vars:
+        ansible_user: "{{ vbox_user }}"
+      file:
+        path: "{{ vm_destination }}"
+        state: directory
+        owner: "{{ vbox_user }}"
+        group: "{{ vbox_user }}"
+        mode: '0755'
+
     - name: Create VMs sequentially
-      include_tasks: vm-setup-tasks.yml
+      include_tasks: vm-setup-tasks-enhanced.yml
       loop: "{{ vm_configs }}"
       loop_control:
         loop_var: vm_config
+        index_var: vm_index
+
+    - name: Wait before final verification
+      pause:
+        seconds: 30
+        prompt: "Waiting for all VMs to stabilize before final verification..."
 
     - name: Final verification - Test all VMs
       delegate_to: "{{ item.final_ip }}"
@@ -53,12 +110,62 @@
         ansible_user: "{{ final_user }}"
       ping:
       loop: "{{ vm_configs }}"
+      register: final_verification
+      failed_when: false
+
+    - name: Display verification results
+      debug:
+        msg: |
+          VM Verification Results:
+          {% for result in final_verification.results %}
+          - {{ vm_configs[loop.index0].name }} ({{ vm_configs[loop.index0].final_ip }}): {{ 'SUCCESS' if not result.failed else 'FAILED' }}
+          {% end for %}
 
     - name: Display completion summary
       debug:
         msg: |
+          ===============================================
           VM Cluster Setup Complete!
+          ===============================================
           Created VMs:
           {% for vm in vm_configs %}
           - {{ vm.name }} ({{ vm.hostname }}) - {{ vm.final_ip }}
-          {% endfor %}
+          {% end for %}
+          
+          Next Steps:
+          1. Test SSH access: ssh ubuntu@<vm_ip>
+          2. Run Kubernetes setup: ansible-playbook kubernetes-setup.yml
+          3. Verify cluster: kubectl get nodes
+          ===============================================
+
+    - name: Display failed VMs if any
+      debug:
+        msg: |
+          WARNING: Some VMs failed final verification!
+          Failed VMs:
+          {% for result in final_verification.results %}
+          {% if result.failed %}
+          - {{ vm_configs[loop.index0].name }} ({{ vm_configs[loop.index0].final_ip }})
+          {% endif %}
+          {% end for %}
+          
+          Please check these VMs manually and retry if needed.
+      when: final_verification.results | selectattr('failed') | list | length > 0
+
+    - name: Save VM configuration for future reference
+      delegate_to: localhost
+      copy:
+        content: |
+          # VM Cluster Configuration
+          # Generated: {{ ansible_date_time.iso8601 }}
+          
+          {% for vm in vm_configs %}
+          {{ vm.name }}:
+            hostname: {{ vm.hostname }}
+            ip: {{ vm.final_ip }}
+            ssh: ssh ubuntu@{{ vm.final_ip }}
+          {% end for %}
+        dest: "./vm-cluster-info.txt"
+        mode: '0644'
+      vars:
+        ansible_date_time: "{{ ansible_date_time }}"
