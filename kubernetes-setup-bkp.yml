@@ -1,0 +1,542 @@
+---
+- name: Install Docker and Kubernetes with Enhanced Error Handling
+  hosts: kubernetes
+  become: yes
+  strategy: linear
+  gather_facts: yes
+  vars:
+    kubernetes_version: "1.30.0-1.1"
+    docker_version: "5:26.1.0-1~ubuntu.24.04~noble"
+    pod_network_cidr: "10.244.0.0/16"
+    master_ip: "192.168.1.190"
+    setup_completed_file: "/var/lib/k8s_setup_completed"
+
+    # Logging configuration
+    log_enabled: true
+    log_dir: "/var/log/k8s-setup"
+    local_log_dir: "./logs"
+    master_log_file: "./logs/kubernetes-setup-master.log"
+    combined_log_file: "./logs/kubernetes-setup-combined.log"
+
+  pre_tasks:
+    - name: Create local log directory
+      delegate_to: localhost
+      become: no
+      file:
+        path: "{{ local_log_dir }}"
+        state: directory
+        mode: '0755'
+      run_once: true
+
+    - name: Initialize setup logs
+      delegate_to: localhost
+      become: no
+      shell: |
+        echo "=== Kubernetes Setup Started: $(date) ===" | tee -a "{{ combined_log_file }}"
+        echo "Host: {{ inventory_hostname }}" | tee -a "{{ combined_log_file }}"
+        echo "Role: {{ node_role | default('unknown') }}" | tee -a "{{ combined_log_file }}"
+        echo "IP: {{ ansible_host }}" | tee -a "{{ combined_log_file }}"
+        echo "=========================================" | tee -a "{{ combined_log_file }}"
+      changed_when: false
+
+    - name: Create remote log directory
+      file:
+        path: "{{ log_dir }}"
+        state: directory
+        mode: '0755'
+
+  tasks:
+    # Check for completion flag
+    - name: Check for setup completion flag
+      stat:
+        path: "{{ setup_completed_file }}"
+      register: setup_completed
+
+    - name: Log setup status
+      delegate_to: localhost
+      become: no
+      shell: |
+        echo "[$(date)] [{{ inventory_hostname }}] Setup status: {{ 'Already completed' if setup_completed.stat.exists else 'Starting fresh setup' }}" | tee -a "{{ combined_log_file }}"
+      changed_when: false
+
+    - name: Skip if already completed
+      debug:
+        msg: "Setup already completed on {{ inventory_hostname }}. Skipping."
+      when: setup_completed.stat.exists
+
+    # System preparation
+    - name: System preparation
+      block:
+        - name: Kill conflicting processes
+          shell: |
+            echo "Killing conflicting package manager processes..."
+            for pid in $(ps -ef | grep -E 'unattended-upgr|apt-get|dpkg|apt' | grep -v grep | awk '{print $2}'); do
+              kill -9 $pid 2>/dev/null || true
+            done
+            echo "Process cleanup completed"
+          register: kill_processes
+          changed_when: false
+
+        - name: Remove package locks
+          shell: |
+            echo "Removing package locks..."
+            rm -f /var/lib/dpkg/lock*
+            rm -f /var/lib/apt/lists/lock
+            rm -f /var/cache/apt/archives/lock
+            rm -f /var/cache/apt/archives/partial/lock
+            echo "Package locks removed"
+          changed_when: false
+
+        - name: Fix interrupted dpkg
+          shell: |
+            export DEBIAN_FRONTEND=noninteractive
+            dpkg --configure --force-confdef --force-confold -a
+          register: dpkg_fix
+          changed_when: dpkg_fix.rc == 0
+          failed_when: false
+
+        - name: Update package index
+          apt:
+            update_cache: yes
+            cache_valid_time: 0
+          register: apt_update
+          retries: 3
+          delay: 10
+
+        - name: Log system preparation
+          delegate_to: localhost
+          become: no
+          shell: |
+            echo "[$(date)] [{{ inventory_hostname }}] System preparation completed" | tee -a "{{ combined_log_file }}"
+          changed_when: false
+
+      when: not setup_completed.stat.exists
+
+    # Install prerequisites
+    - name: Install prerequisites
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - software-properties-common
+          - gnupg2
+        state: present
+        update_cache: yes
+      register: prereq_install
+      retries: 3
+      delay: 10
+      when: not setup_completed.stat.exists
+
+    - name: Log prerequisites installation
+      delegate_to: localhost
+      become: no
+      shell: |
+        echo "[$(date)] [{{ inventory_hostname }}] Prerequisites installed: {{ 'SUCCESS' if prereq_install.changed else 'ALREADY INSTALLED' }}" | tee -a "{{ combined_log_file }}"
+      changed_when: false
+      when: not setup_completed.stat.exists
+
+    # Docker installation
+    - name: Docker installation
+      block:
+        - name: Create keyrings directory
+          file:
+            path: /etc/apt/keyrings
+            state: directory
+            mode: '0755'
+
+        - name: Add Docker GPG key
+          shell: |
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg --batch --yes
+            chmod a+r /etc/apt/keyrings/docker.gpg
+            echo "Docker GPG key added successfully"
+          register: docker_key
+          changed_when: docker_key.rc == 0
+
+        - name: Add Docker repository
+          shell: |
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+            apt-get update
+          register: docker_repo
+          changed_when: docker_repo.rc == 0
+
+        - name: Install Docker
+          apt:
+            name:
+              - docker-ce
+              - docker-ce-cli
+              - containerd.io
+            state: present
+            update_cache: yes
+          register: docker_install
+
+        - name: Configure Docker daemon
+          copy:
+            content: |
+              {
+                "exec-opts": ["native.cgroupdriver=systemd"],
+                "log-driver": "json-file",
+                "log-opts": {
+                  "max-size": "100m"
+                },
+                "storage-driver": "overlay2"
+              }
+            dest: /etc/docker/daemon.json
+            mode: '0644'
+          register: docker_config
+
+        - name: Start and enable Docker
+          systemd:
+            name: docker
+            state: started
+            enabled: yes
+            daemon_reload: yes
+          register: docker_service
+
+        - name: Add ubuntu user to docker group
+          user:
+            name: ubuntu
+            groups: docker
+            append: yes
+
+        - name: Log Docker installation
+          delegate_to: localhost
+          become: no
+          shell: |
+            echo "[$(date)] [{{ inventory_hostname }}] Docker installation: SUCCESS" | tee -a "{{ combined_log_file }}"
+          changed_when: false
+
+      when: not setup_completed.stat.exists
+
+    # Kubernetes installation
+    - name: Kubernetes installation
+      block:
+        - name: Add Kubernetes GPG key
+          shell: |
+            curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg --batch --yes
+            chmod a+r /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+            echo "Kubernetes GPG key added successfully"
+          register: k8s_key
+          changed_when: k8s_key.rc == 0
+
+        - name: Add Kubernetes repository
+          shell: |
+            echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.30/deb/ /' | tee /etc/apt/sources.list.d/kubernetes.list
+            apt-get update
+          register: k8s_repo
+          changed_when: k8s_repo.rc == 0
+
+        - name: Install Kubernetes components
+          apt:
+            name:
+              - kubelet={{ kubernetes_version }}
+              - kubeadm={{ kubernetes_version }}
+              - kubectl={{ kubernetes_version }}
+            state: present
+            update_cache: yes
+          register: k8s_install
+
+        - name: Hold Kubernetes packages
+          dpkg_selections:
+            name: "{{ item }}"
+            selection: hold
+          loop:
+            - kubelet
+            - kubeadm
+            - kubectl
+
+        - name: Configure kubelet
+          lineinfile:
+            path: /etc/default/kubelet
+            line: 'KUBELET_EXTRA_ARGS=--cgroup-driver=systemd'
+            create: yes
+          register: kubelet_config
+
+        - name: Enable kubelet service
+          systemd:
+            name: kubelet
+            enabled: yes
+            daemon_reload: yes
+
+        - name: Log Kubernetes installation
+          delegate_to: localhost
+          become: no
+          shell: |
+            echo "[$(date)] [{{ inventory_hostname }}] Kubernetes components installed: SUCCESS" | tee -a "{{ combined_log_file }}"
+          changed_when: false
+
+      when: not setup_completed.stat.exists
+
+    # System configuration
+    - name: System configuration
+      block:
+        - name: Load kernel modules
+          shell: |
+            echo "Loading kernel modules..."
+            modprobe overlay
+            modprobe br_netfilter
+            echo "overlay" >> /etc/modules-load.d/k8s.conf
+            echo "br_netfilter" >> /etc/modules-load.d/k8s.conf
+          register: kernel_modules
+          changed_when: kernel_modules.rc == 0
+
+        - name: Configure kernel parameters
+          copy:
+            content: |
+              net.bridge.bridge-nf-call-iptables = 1
+              net.bridge.bridge-nf-call-ip6tables = 1
+              net.ipv4.ip_forward = 1
+            dest: /etc/sysctl.d/k8s.conf
+            mode: '0644'
+          register: sysctl_config
+
+        - name: Apply kernel parameters
+          shell: sysctl --system
+          register: sysctl_apply
+          changed_when: sysctl_apply.rc == 0
+
+        - name: Disable swap
+          shell: |
+            swapoff -a
+            sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+          register: swap_disable
+          changed_when: swap_disable.rc == 0
+
+        - name: Log system configuration
+          delegate_to: localhost
+          become: no
+          shell: |
+            echo "[$(date)] [{{ inventory_hostname }}] System configuration completed: SUCCESS" | tee -a "{{ combined_log_file }}"
+          changed_when: false
+
+      when: not setup_completed.stat.exists
+
+    # Master node initialization
+    - name: Initialize Kubernetes master
+      block:
+        - name: Check if cluster is already initialized
+          stat:
+            path: /etc/kubernetes/admin.conf
+          register: cluster_initialized
+
+        - name: Initialize Kubernetes cluster
+          shell: |
+            echo "Initializing Kubernetes cluster..."
+            kubeadm init \
+              --pod-network-cidr={{ pod_network_cidr }} \
+              --apiserver-advertise-address={{ master_ip }} \
+              --ignore-preflight-errors=all \
+              --v=5
+          register: kubeadm_init
+          when: not cluster_initialized.stat.exists
+          failed_when: kubeadm_init.rc != 0
+
+        - name: Log kubeadm initialization
+          delegate_to: localhost
+          become: no
+          shell: |
+            echo "[$(date)] [{{ inventory_hostname }}] Kubeadm init output:" | tee -a "{{ combined_log_file }}"
+            echo "{{ kubeadm_init.stdout | default('No output') }}" | tee -a "{{ combined_log_file }}"
+            echo "{{ kubeadm_init.stderr | default('No errors') }}" | tee -a "{{ combined_log_file }}"
+          changed_when: false
+          when: kubeadm_init is defined
+
+        - name: Verify admin.conf creation
+          stat:
+            path: /etc/kubernetes/admin.conf
+          register: admin_conf_verify
+          failed_when: not admin_conf_verify.stat.exists
+
+        - name: Set up kubeconfig for ubuntu user
+          shell: |
+            mkdir -p /home/ubuntu/.kube
+            cp /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
+            chown -R ubuntu:ubuntu /home/ubuntu/.kube
+            chmod 600 /home/ubuntu/.kube/config
+          register: kubeconfig_setup
+          when: admin_conf_verify.stat.exists
+
+        - name: Test kubectl access
+          shell: kubectl get nodes
+          become_user: ubuntu
+          register: kubectl_test
+          failed_when: kubectl_test.rc != 0
+
+        - name: Generate join command
+          shell: kubeadm token create --print-join-command
+          register: join_command
+          when: kubectl_test.rc == 0
+
+        - name: Save join command locally
+          delegate_to: localhost
+          become: no
+          copy:
+            content: "{{ join_command.stdout }}"
+            dest: "{{ local_log_dir }}/k8s-join-command.sh"
+            mode: '0755'
+          when: join_command is defined and join_command.stdout is defined
+
+        - name: Log master initialization
+          delegate_to: localhost
+          become: no
+          shell: |
+            echo "[$(date)] [{{ inventory_hostname }}] Master initialization: SUCCESS" | tee -a "{{ combined_log_file }}"
+            echo "[$(date)] [{{ inventory_hostname }}] admin.conf verified: {{ 'EXISTS' if admin_conf_verify.stat.exists else 'MISSING' }}" | tee -a "{{ combined_log_file }}"
+            echo "[$(date)] [{{ inventory_hostname }}] kubectl test: {{ 'SUCCESS' if kubectl_test.rc == 0 else 'FAILED' }}" | tee -a "{{ combined_log_file }}"
+          changed_when: false
+
+      when: not setup_completed.stat.exists and node_role == 'master'
+
+    # Worker node setup
+    - name: Setup worker nodes
+      block:
+        - name: Check if join command exists
+          delegate_to: localhost
+          become: no
+          stat:
+            path: "{{ local_log_dir }}/k8s-join-command.sh"
+          register: join_command_file
+
+        - name: Read join command
+          delegate_to: localhost
+          become: no
+          shell: cat "{{ local_log_dir }}/k8s-join-command.sh"
+          register: join_command_content
+          when: join_command_file.stat.exists
+
+        - name: Join worker to cluster
+          shell: "{{ join_command_content.stdout }}"
+          register: worker_join
+          when: join_command_file.stat.exists and join_command_content.stdout is defined
+          failed_when: worker_join.rc != 0
+
+        - name: Log worker join
+          delegate_to: localhost
+          become: no
+          shell: |
+            echo "[$(date)] [{{ inventory_hostname }}] Worker join: {{ 'SUCCESS' if worker_join.rc == 0 else 'FAILED' }}" | tee -a "{{ combined_log_file }}"
+          changed_when: false
+          when: worker_join is defined
+
+      when: not setup_completed.stat.exists and node_role == 'worker'
+
+    # Install CNI (only on master)
+    - name: Install Flannel CNI
+      shell: kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
+      become_user: ubuntu
+      register: flannel_install
+      when: not setup_completed.stat.exists and node_role == 'master'
+      failed_when: flannel_install.rc != 0
+
+    - name: Log CNI installation
+      delegate_to: localhost
+      become: no
+      shell: |
+        echo "[$(date)] [{{ inventory_hostname }}] Flannel CNI installation: {{ 'SUCCESS' if flannel_install.rc == 0 else 'FAILED' }}" | tee -a "{{ combined_log_file }}"
+      changed_when: false
+      when: flannel_install is defined and node_role == 'master'
+
+    # Mark setup as completed
+    - name: Mark setup as completed
+      file:
+        path: "{{ setup_completed_file }}"
+        state: touch
+        mode: '0644'
+      when: not setup_completed.stat.exists
+
+    - name: Final verification
+      shell: |
+        echo "=== Final Verification ==="
+        echo "Docker status:"
+        systemctl status docker --no-pager | head -5
+        echo ""
+        echo "Kubelet status:"
+        systemctl status kubelet --no-pager | head -5
+        echo ""
+        if [ "{{ node_role }}" == "master" ]; then
+          echo "Cluster nodes:"
+          kubectl get nodes 2>/dev/null || echo "kubectl not accessible"
+          echo ""
+          echo "System pods:"
+          kubectl get pods -n kube-system 2>/dev/null || echo "kubectl not accessible"
+        fi
+      register: final_verification
+      become_user: ubuntu
+      when: node_role == 'master'
+      changed_when: false
+
+    - name: Log final status
+      delegate_to: localhost
+      become: no
+      shell: |
+        echo "[$(date)] [{{ inventory_hostname }}] SETUP COMPLETED SUCCESSFULLY" | tee -a "{{ combined_log_file }}"
+        echo "Final verification output:" | tee -a "{{ combined_log_file }}"
+        echo "{{ final_verification.stdout | default('No verification output') }}" | tee -a "{{ combined_log_file }}"
+        echo "=========================================" | tee -a "{{ combined_log_file }}"
+      changed_when: false
+      when: final_verification is defined
+
+  post_tasks:
+    - name: Display completion summary
+      debug:
+        msg: |
+          ===================================================
+          Kubernetes Setup Complete for {{ inventory_hostname }}
+          ===================================================
+          Role: {{ node_role }}
+          IP: {{ ansible_host }}
+          Status: {{ 'SUCCESS' if not setup_completed.stat.exists else 'ALREADY COMPLETED' }}
+          
+          {% if node_role == 'master' %}
+          Master-specific files:
+          - kubeconfig: /home/ubuntu/.kube/config
+          - admin.conf: /etc/kubernetes/admin.conf
+          - join command: {{ local_log_dir }}/k8s-join-command.sh
+          
+          Next steps:
+          1. Verify cluster: kubectl get nodes
+          2. Check pods: kubectl get pods -n kube-system
+          3. Deploy applications: kubectl apply -f your-app.yaml
+          {% endif %}
+          
+          Logs available at: {{ combined_log_file }}
+          ===================================================
+
+    - name: Save setup summary
+      delegate_to: localhost
+      become: no
+      copy:
+        content: |
+          # Kubernetes Cluster Setup Summary
+          # Generated: {{ ansible_date_time.iso8601 }}
+          
+          ## Cluster Information
+          - Master: {{ hostvars['master']['ansible_host'] }}
+          - Pod Network: {{ pod_network_cidr }}
+          - Kubernetes Version: {{ kubernetes_version }}
+          
+          ## Nodes
+          {% for host in groups['kubernetes'] %}
+          - {{ host }}: {{ hostvars[host]['ansible_host'] }} ({{ hostvars[host]['node_role'] }})
+          {% endfor %}
+          
+          ## Access Commands
+          ```bash
+          # SSH to master
+          ssh ubuntu@{{ hostvars['master']['ansible_host'] }}
+          
+          # Check cluster status
+          kubectl get nodes
+          kubectl get pods -n kube-system
+          
+          # View logs
+          tail -f {{ combined_log_file }}
+          ```
+          
+          ## Join Command for Additional Workers
+          ```bash
+          # Command saved in: {{ local_log_dir }}/k8s-join-command.sh
+          ```
+        dest: "{{ local_log_dir }}/cluster-setup-summary.md"
+        mode: '0644'
+      run_once: true
