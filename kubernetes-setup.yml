@@ -1,9 +1,8 @@
-
 ---
-- name: Install Docker and Kubernetes with robust error handling
+- name: Install Docker and Kubernetes
   hosts: kubernetes
   become: yes
-  strategy: free
+  strategy: linear
   vars:
     kubernetes_version: "1.30.0-1.1"
     docker_version: "5:26.1.0-1~ubuntu.24.04~noble"
@@ -13,20 +12,136 @@
     apt_retry_delay: 30
     apt_timeout: 180
     wait_for_auto_tasks: true
-    # Status tracking to avoid rerunning completed tasks
     setup_completed_file: "/var/lib/k8s_setup_completed"
+    progress_dir: "/var/lib/k8s_setup_progress"
+    # Logging configuration
+    log_enabled: true
+    log_dir: "/var/log/k8s-setup"
+    log_file: "k8s-setup-{{ ansible_date_time.date }}-{{ ansible_date_time.time | regex_replace(':', '-') }}.log"
+    local_log_dir: "./logs"
+    host_combined_log: "./logs/host-{{ inventory_hostname }}-combined.log"
+    
+  pre_tasks:
+    # Create local log directory
+    - name: Create local log directory
+      delegate_to: localhost
+      become: no
+      file:
+        path: "{{ local_log_dir }}"
+        state: directory
+        mode: '0755'
+      run_once: true
+      when: log_enabled
+      ignore_errors: true
+
+    # Initialize host log file
+    - name: Initialize host log file
+      delegate_to: localhost
+      become: no
+      copy:
+        content: |
+          =================================================================
+          Kubernetes Setup Log for {{ inventory_hostname }}
+          Started: {{ ansible_date_time.iso8601 }}
+          =================================================================
+          
+        dest: "{{ host_combined_log }}"
+        mode: '0644'
+      when: log_enabled
+      ignore_errors: true
+
+    # Create remote log directory
+    - name: Create remote log directory
+      file:
+        path: "{{ log_dir }}"
+        state: directory
+        mode: '0755'
+      when: log_enabled
+      ignore_errors: true
+
+    # Create progress tracking directory
+    - name: Create progress tracking directory
+      file:
+        path: "{{ progress_dir }}"
+        state: directory
+        mode: '0755'
+      ignore_errors: true
+
+    # Initialize remote log file
+    - name: Initialize remote log file
+      shell: |
+        echo "==================================================================" > {{ log_dir }}/{{ log_file }}
+        echo "Kubernetes Setup Log for {{ inventory_hostname }}" >> {{ log_dir }}/{{ log_file }}
+        echo "Started: $(date)" >> {{ log_dir }}/{{ log_file }}
+        echo "==================================================================" >> {{ log_dir }}/{{ log_file }}
+        echo "" >> {{ log_dir }}/{{ log_file }}
+      when: log_enabled
+      changed_when: false
+      ignore_errors: true
+
+    # Load progress data if it exists
+    - name: Load progress data if it exists
+      stat:
+        path: "{{ progress_dir }}/progress.json"
+      register: progress_file
+      ignore_errors: true
+
+    - name: Initialize progress data if not exists
+      set_fact:
+        setup_progress: {}
+      when: not progress_file.stat.exists|default(false)
+      ignore_errors: true
+
+    - name: Read progress data if exists
+      slurp:
+        src: "{{ progress_dir }}/progress.json"
+      register: progress_data
+      when: progress_file.stat.exists|default(false)
+      ignore_errors: true
+
+    - name: Parse progress data
+      set_fact:
+        setup_progress: "{{ (progress_data.content|b64decode)|from_json if progress_data is defined and progress_data.content is defined else {} }}"
+      when: progress_file.stat.exists|default(false)
+      ignore_errors: true
+
+    - name: Log progress status
+      shell: |
+        echo "[$(date +%Y-%m-%d\ %H:%M:%S)] [INFO] Progress status:" >> {{ log_dir }}/{{ log_file }}
+        echo "{{ setup_progress | to_nice_json }}" >> {{ log_dir }}/{{ log_file }}
+      when: log_enabled
+      changed_when: false
+      ignore_errors: true
+
+    # Transfer initial logs
+    - name: Fetch pre-task log
+      fetch:
+        src: "{{ log_dir }}/{{ log_file }}"
+        dest: "{{ local_log_dir }}/temp-{{ inventory_hostname }}-pretask.log"
+        flat: yes
+      ignore_errors: true
+      when: log_enabled
+          
+    - name: Append to host log
+      delegate_to: localhost
+      become: no
+      shell: |
+        if [ -f "{{ local_log_dir }}/temp-{{ inventory_hostname }}-pretask.log" ]; then
+          cat "{{ local_log_dir }}/temp-{{ inventory_hostname }}-pretask.log" >> "{{ host_combined_log }}"
+          rm "{{ local_log_dir }}/temp-{{ inventory_hostname }}-pretask.log"
+        fi
+      ignore_errors: true
+      when: log_enabled
+      changed_when: false
 
   tasks:
-    - name: Display hostname for debugging
-      debug:
-        msg: "Working on host: {{ inventory_hostname }}"
-      tags: always
-
+    # Check for setup completion flag
     - name: Check for setup completion flag
       stat:
         path: "{{ setup_completed_file }}"
       register: setup_completed
       tags: always
+      ignore_errors: true
 
     # Skip setup if already completed
     - name: Check if setup already completed
@@ -35,7 +150,52 @@
       when: setup_completed.stat.exists
       tags: always
 
-    - name: Kill package manager processes without using pkill
+    # Transfer logs after checking setup status
+    - name: Log setup check
+      shell: |
+        echo "[$(date +%Y-%m-%d\ %H:%M:%S)] [INFO] Task: setup completion check ({{ 'completed' if setup_completed is defined else 'failed' }})" >> {{ log_dir }}/{{ log_file }}
+        echo "OUTPUT: Setup status: {{ 'Completed' if setup_completed.stat.exists|default(false) else 'Not completed' }}" >> {{ log_dir }}/{{ log_file }}
+      when: log_enabled
+      changed_when: false
+      ignore_errors: true
+
+    - name: Transfer setup check logs
+      fetch:
+        src: "{{ log_dir }}/{{ log_file }}"
+        dest: "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        flat: yes
+      ignore_errors: true
+      when: log_enabled
+      
+    - name: Append setup check to host log
+      delegate_to: localhost
+      become: no
+      shell: |
+        echo "\n[{{ ansible_date_time.iso8601 }}] Task: setup completion check" >> "{{ host_combined_log }}"
+        if [ -f "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" ]; then
+          cat "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" >> "{{ host_combined_log }}"
+          rm "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        fi
+      ignore_errors: true
+      when: log_enabled
+      changed_when: false
+
+    # Display resume information
+    - name: Display resume information
+      debug:
+        msg: |
+          Setup will resume from the last successful step.
+          Current progress: 
+          {% for stage, tasks in setup_progress.items() %}
+          Stage: {{ stage }}
+            {% for task, status in tasks.items() %}
+            - {{ task }}: {{ status }}
+            {% endfor %}
+          {% endfor %}
+      when: setup_progress is defined and setup_progress|length > 0 and not setup_completed.stat.exists
+
+    # System preparation tasks
+    - name: Kill package manager processes
       shell: |
         for pid in $(ps -ef | grep -E 'unattended-upgr|apt-get|dpkg|apt' | grep -v grep | awk '{print $2}'); do
           kill -9 $pid 2>/dev/null || true
@@ -44,7 +204,38 @@
       changed_when: true
       failed_when: false
       when: not setup_completed.stat.exists
-      tags: always
+      register: kill_result
+      tags: prepare_system
+
+    # Log and transfer after killing package manager
+    - name: Log kill package manager
+      shell: |
+        echo "[$(date +%Y-%m-%d\ %H:%M:%S)] [INFO] Task: kill package manager processes ({{ 'completed' if kill_result is defined and kill_result.changed|default(false) else 'skipped/failed' }})" >> {{ log_dir }}/{{ log_file }}
+        echo "OUTPUT: {{ kill_result.stdout|default('') }}" >> {{ log_dir }}/{{ log_file }}
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+      ignore_errors: true
+
+    - name: Transfer kill package manager logs
+      fetch:
+        src: "{{ log_dir }}/{{ log_file }}"
+        dest: "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        flat: yes
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      
+    - name: Append kill package manager to host log
+      delegate_to: localhost
+      become: no
+      shell: |
+        echo "\n[{{ ansible_date_time.iso8601 }}] Task: kill package manager processes" >> "{{ host_combined_log }}"
+        if [ -f "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" ]; then
+          cat "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" >> "{{ host_combined_log }}"
+          rm "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        fi
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
 
     - name: Remove package locks
       shell: |
@@ -56,19 +247,79 @@
       changed_when: true
       failed_when: false
       when: not setup_completed.stat.exists
-      tags: always
+      register: locks_result
+      tags: prepare_system
+
+    # Log and transfer after removing package locks
+    - name: Log remove package locks
+      shell: |
+        echo "[$(date +%Y-%m-%d\ %H:%M:%S)] [INFO] Task: remove package locks ({{ 'completed' if locks_result is defined and locks_result.changed|default(false) else 'skipped/failed' }})" >> {{ log_dir }}/{{ log_file }}
+        echo "OUTPUT: {{ locks_result.stdout|default('') }}" >> {{ log_dir }}/{{ log_file }}
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+      ignore_errors: true
+
+    - name: Transfer remove locks logs
+      fetch:
+        src: "{{ log_dir }}/{{ log_file }}"
+        dest: "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        flat: yes
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      
+    - name: Append remove locks to host log
+      delegate_to: localhost
+      become: no
+      shell: |
+        echo "\n[{{ ansible_date_time.iso8601 }}] Task: remove package locks" >> "{{ host_combined_log }}"
+        if [ -f "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" ]; then
+          cat "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" >> "{{ host_combined_log }}"
+          rm "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        fi
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
 
     - name: Fix interrupted dpkg
       shell: |
-        # Set noninteractive mode
         export DEBIAN_FRONTEND=noninteractive
-        # Try with force options to handle dependency issues
-        dpkg --configure --force-confdef --force-confold -a || true
+        dpkg --configure --force-confdef --force-confold -a
         exit 0
       changed_when: true
       failed_when: false
       when: not setup_completed.stat.exists
-      tags: always
+      register: dpkg_result
+      tags: prepare_system
+
+    # Log and transfer after fixing dpkg
+    - name: Log fix dpkg
+      shell: |
+        echo "[$(date +%Y-%m-%d\ %H:%M:%S)] [INFO] Task: fix interrupted dpkg ({{ 'completed' if dpkg_result is defined and dpkg_result.changed|default(false) else 'skipped/failed' }})" >> {{ log_dir }}/{{ log_file }}
+        echo "OUTPUT: {{ dpkg_result.stdout|default('') }}" >> {{ log_dir }}/{{ log_file }}
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+      ignore_errors: true
+
+    - name: Transfer fix dpkg logs
+      fetch:
+        src: "{{ log_dir }}/{{ log_file }}"
+        dest: "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        flat: yes
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      
+    - name: Append fix dpkg to host log
+      delegate_to: localhost
+      become: no
+      shell: |
+        echo "\n[{{ ansible_date_time.iso8601 }}] Task: fix interrupted dpkg" >> "{{ host_combined_log }}"
+        if [ -f "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" ]; then
+          cat "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" >> "{{ host_combined_log }}"
+          rm "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        fi
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
 
     - name: Clean apt cache
       shell: |
@@ -77,75 +328,164 @@
       changed_when: true
       failed_when: false
       when: not setup_completed.stat.exists
-      tags: always
+      register: clean_result
+      tags: prepare_system
 
-    - name: Fix broken dependencies with non-interactive and timeout
+    # Log and transfer after cleaning apt cache
+    - name: Log clean apt cache
+      shell: |
+        echo "[$(date +%Y-%m-%d\ %H:%M:%S)] [INFO] Task: clean apt cache ({{ 'completed' if clean_result is defined and clean_result.changed|default(false) else 'skipped/failed' }})" >> {{ log_dir }}/{{ log_file }}
+        echo "OUTPUT: {{ clean_result.stdout|default('') }}" >> {{ log_dir }}/{{ log_file }}
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+      ignore_errors: true
+
+    - name: Transfer clean cache logs
+      fetch:
+        src: "{{ log_dir }}/{{ log_file }}"
+        dest: "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        flat: yes
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      
+    - name: Append clean cache to host log
+      delegate_to: localhost
+      become: no
+      shell: |
+        echo "\n[{{ ansible_date_time.iso8601 }}] Task: clean apt cache" >> "{{ host_combined_log }}"
+        if [ -f "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" ]; then
+          cat "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" >> "{{ host_combined_log }}"
+          rm "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        fi
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+
+    - name: Fix broken dependencies
       shell: |
         export DEBIAN_FRONTEND=noninteractive
         timeout {{ apt_timeout }} apt-get -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" -f install -y
         exit 0
-      register: apt_fix_broken
       changed_when: true
       failed_when: false
       when: not setup_completed.stat.exists
-      tags: always
+      register: fix_deps_result
+      tags: prepare_system
 
-    - name: Wait for any automatic updates to complete
+    # Log and transfer after fixing broken dependencies
+    - name: Log fix broken dependencies
       shell: |
-        count=0
-        # Wait for up to 5 minutes
-        while [ $count -lt 30 ]; do
-          if pgrep -f unattended-upgr > /dev/null || pgrep -f apt > /dev/null || pgrep -f dpkg > /dev/null; then
-            echo "Waiting for package managers to finish... ($count/30)"
-            sleep 10
-            count=$((count+1))
-          else
-            echo "No package managers running."
-            break
-          fi
-        done
-        exit 0
+        echo "[$(date +%Y-%m-%d\ %H:%M:%S)] [INFO] Task: fix broken dependencies ({{ 'completed' if fix_deps_result is defined and fix_deps_result.changed|default(false) else 'skipped/failed' }})" >> {{ log_dir }}/{{ log_file }}
+        echo "OUTPUT: {{ fix_deps_result.stdout|default('') }}" >> {{ log_dir }}/{{ log_file }}
+      when: log_enabled and not setup_completed.stat.exists
       changed_when: false
-      when: wait_for_auto_tasks and not setup_completed.stat.exists
-      tags: always
+      ignore_errors: true
 
-    - name: Update apt package index with timeout
+    - name: Transfer fix deps logs
+      fetch:
+        src: "{{ log_dir }}/{{ log_file }}"
+        dest: "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        flat: yes
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      
+    - name: Append fix deps to host log
+      delegate_to: localhost
+      become: no
+      shell: |
+        echo "\n[{{ ansible_date_time.iso8601 }}] Task: fix broken dependencies" >> "{{ host_combined_log }}"
+        if [ -f "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" ]; then
+          cat "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" >> "{{ host_combined_log }}"
+          rm "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        fi
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+
+    - name: Update apt package index
       shell: |
         export DEBIAN_FRONTEND=noninteractive
         timeout {{ apt_timeout }} apt-get update
         exit 0
-      register: apt_update_result
       changed_when: true
       failed_when: false
       when: not setup_completed.stat.exists
-      tags: always
+      register: update_result
+      tags: prepare_system
 
-    # Install basic packages first
-    - name: Install required packages with timeout
+    # Log and transfer after updating apt
+    - name: Log update apt
+      shell: |
+        echo "[$(date +%Y-%m-%d\ %H:%M:%S)] [INFO] Task: update apt package index ({{ 'completed' if update_result is defined and update_result.changed|default(false) else 'skipped/failed' }})" >> {{ log_dir }}/{{ log_file }}
+        echo "OUTPUT: {{ update_result.stdout|default('') }}" >> {{ log_dir }}/{{ log_file }}
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+      ignore_errors: true
+
+    - name: Transfer update apt logs
+      fetch:
+        src: "{{ log_dir }}/{{ log_file }}"
+        dest: "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        flat: yes
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      
+    - name: Append update apt to host log
+      delegate_to: localhost
+      become: no
+      shell: |
+        echo "\n[{{ ansible_date_time.iso8601 }}] Task: update apt package index" >> "{{ host_combined_log }}"
+        if [ -f "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" ]; then
+          cat "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" >> "{{ host_combined_log }}"
+          rm "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        fi
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+
+    # Install basic packages
+    - name: Install required packages
       shell: |
         export DEBIAN_FRONTEND=noninteractive
         timeout {{ apt_timeout }} apt-get -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" install -y apt-transport-https ca-certificates curl software-properties-common
         exit 0
+      changed_when: true
+      failed_when: false
+      when: not setup_completed.stat.exists
       register: pkg_result
-      changed_when: true
-      failed_when: false
-      when: not setup_completed.stat.exists
-      tags: always
+      tags: prepare_system
 
-    # Fix package issues with linux-generic on worker4
-    - name: Install missing linux-headers if needed
+    # Log and transfer after installing basic packages
+    - name: Log install packages
       shell: |
-        export DEBIAN_FRONTEND=noninteractive
-        if dpkg -l | grep linux-generic | grep -q "iU"; then
-          apt-get -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" install -y linux-headers-generic
-        fi
-        exit 0
-      changed_when: true
-      failed_when: false
-      when: not setup_completed.stat.exists
-      tags: always
+        echo "[$(date +%Y-%m-%d\ %H:%M:%S)] [INFO] Task: install required packages ({{ 'completed' if pkg_result is defined and pkg_result.changed|default(false) else 'skipped/failed' }})" >> {{ log_dir }}/{{ log_file }}
+        echo "OUTPUT: {{ pkg_result.stdout|default('') }}" >> {{ log_dir }}/{{ log_file }}
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+      ignore_errors: true
 
-    # Docker GPG key
+    - name: Transfer install packages logs
+      fetch:
+        src: "{{ log_dir }}/{{ log_file }}"
+        dest: "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        flat: yes
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      
+    - name: Append install packages to host log
+      delegate_to: localhost
+      become: no
+      shell: |
+        echo "\n[{{ ansible_date_time.iso8601 }}] Task: install required packages" >> "{{ host_combined_log }}"
+        if [ -f "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" ]; then
+          cat "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" >> "{{ host_combined_log }}"
+          rm "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        fi
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+
+    # Docker installation
     - name: Create keyrings directory
       file:
         path: /etc/apt/keyrings
@@ -153,116 +493,202 @@
         mode: '0755'
       when: not setup_completed.stat.exists
       failed_when: false
+      register: keyrings_dir_result
+      tags: docker_setup
+
+    # Log and transfer after creating keyrings directory
+    - name: Log create keyrings
+      shell: |
+        echo "[$(date +%Y-%m-%d\ %H:%M:%S)] [INFO] Task: create keyrings directory ({{ 'completed' if keyrings_dir_result is defined and keyrings_dir_result.changed|default(false) else 'skipped/failed' }})" >> {{ log_dir }}/{{ log_file }}
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+      ignore_errors: true
+
+    - name: Transfer keyrings logs
+      fetch:
+        src: "{{ log_dir }}/{{ log_file }}"
+        dest: "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        flat: yes
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      
+    - name: Append keyrings to host log
+      delegate_to: localhost
+      become: no
+      shell: |
+        echo "\n[{{ ansible_date_time.iso8601 }}] Task: create keyrings directory" >> "{{ host_combined_log }}"
+        if [ -f "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" ]; then
+          cat "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" >> "{{ host_combined_log }}"
+          rm "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        fi
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
 
     - name: Add Docker GPG key
       shell: |
-        mkdir -p /etc/apt/keyrings
         curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
         chmod a+r /etc/apt/keyrings/docker.gpg
         exit 0
-      args:
-        creates: /etc/apt/keyrings/docker.gpg
       changed_when: true
       failed_when: false
       when: not setup_completed.stat.exists
+      register: docker_key_result
+      tags: docker_setup
 
-    # Docker repository
+    # Log and transfer after adding Docker GPG key
+    - name: Log Docker GPG key
+      shell: |
+        echo "[$(date +%Y-%m-%d\ %H:%M:%S)] [INFO] Task: add Docker GPG key ({{ 'completed' if docker_key_result is defined and docker_key_result.changed|default(false) else 'skipped/failed' }})" >> {{ log_dir }}/{{ log_file }}
+        echo "OUTPUT: {{ docker_key_result.stdout|default('') }}" >> {{ log_dir }}/{{ log_file }}
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+      ignore_errors: true
+
+    - name: Transfer Docker key logs
+      fetch:
+        src: "{{ log_dir }}/{{ log_file }}"
+        dest: "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        flat: yes
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      
+    - name: Append Docker key to host log
+      delegate_to: localhost
+      become: no
+      shell: |
+        echo "\n[{{ ansible_date_time.iso8601 }}] Task: add Docker GPG key" >> "{{ host_combined_log }}"
+        if [ -f "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" ]; then
+          cat "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" >> "{{ host_combined_log }}"
+          rm "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        fi
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+
     - name: Add Docker repository
       shell: |
-        echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
         exit 0
-      args:
-        creates: /etc/apt/sources.list.d/docker.list
-      register: docker_repo_added
       changed_when: true
       failed_when: false
       when: not setup_completed.stat.exists
+      register: docker_repo_result
+      tags: docker_setup
+
+    # Log and transfer after adding Docker repository
+    - name: Log Docker repository
+      shell: |
+        echo "[$(date +%Y-%m-%d\ %H:%M:%S)] [INFO] Task: add Docker repository ({{ 'completed' if docker_repo_result is defined and docker_repo_result.changed|default(false) else 'skipped/failed' }})" >> {{ log_dir }}/{{ log_file }}
+        echo "OUTPUT: {{ docker_repo_result.stdout|default('') }}" >> {{ log_dir }}/{{ log_file }}
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+      ignore_errors: true
+
+    - name: Transfer Docker repo logs
+      fetch:
+        src: "{{ log_dir }}/{{ log_file }}"
+        dest: "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        flat: yes
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      
+    - name: Append Docker repo to host log
+      delegate_to: localhost
+      become: no
+      shell: |
+        echo "\n[{{ ansible_date_time.iso8601 }}] Task: add Docker repository" >> "{{ host_combined_log }}"
+        if [ -f "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" ]; then
+          cat "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" >> "{{ host_combined_log }}"
+          rm "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        fi
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
 
     - name: Update apt cache after adding Docker repo
       shell: |
         export DEBIAN_FRONTEND=noninteractive
         timeout {{ apt_timeout }} apt-get update
         exit 0
-      register: apt_update_docker
       changed_when: true
       failed_when: false
-      when: docker_repo_added.changed and not setup_completed.stat.exists
+      when: not setup_completed.stat.exists
+      register: apt_update_docker_result
+      tags: docker_setup
 
-    # Docker installation
-    - name: Install Docker with timeout
+    # Log and transfer after updating apt cache for Docker
+    - name: Log apt update Docker
+      shell: |
+        echo "[$(date +%Y-%m-%d\ %H:%M:%S)] [INFO] Task: update apt cache for Docker ({{ 'completed' if apt_update_docker_result is defined and apt_update_docker_result.changed|default(false) else 'skipped/failed' }})" >> {{ log_dir }}/{{ log_file }}
+        echo "OUTPUT: {{ apt_update_docker_result.stdout|default('') }}" >> {{ log_dir }}/{{ log_file }}
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+      ignore_errors: true
+
+    - name: Transfer Docker apt update logs
+      fetch:
+        src: "{{ log_dir }}/{{ log_file }}"
+        dest: "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        flat: yes
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      
+    - name: Append Docker apt update to host log
+      delegate_to: localhost
+      become: no
+      shell: |
+        echo "\n[{{ ansible_date_time.iso8601 }}] Task: update apt cache for Docker" >> "{{ host_combined_log }}"
+        if [ -f "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" ]; then
+          cat "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" >> "{{ host_combined_log }}"
+          rm "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        fi
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+
+    - name: Install Docker with specific version
       shell: |
         export DEBIAN_FRONTEND=noninteractive
-        timeout {{ apt_timeout }} apt-get -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" install -y docker-ce
+        timeout {{ apt_timeout }} apt-get -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" install -y docker-ce={{ docker_version }} docker-ce-cli={{ docker_version }} containerd.io
         exit 0
+      changed_when: true
+      failed_when: false
+      when: not setup_completed.stat.exists
       register: docker_install_result
-      changed_when: true
-      failed_when: false
-      when: not setup_completed.stat.exists
+      tags: docker_setup
 
-    # K8s GPG key
-    - name: Add Kubernetes GPG key
+    # Log and transfer after installing Docker
+    - name: Log install Docker
       shell: |
-        mkdir -p /etc/apt/keyrings
-        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes.gpg
-        chmod a+r /etc/apt/keyrings/kubernetes.gpg
-        exit 0
-      args:
-        creates: /etc/apt/keyrings/kubernetes.gpg
-      changed_when: true
-      failed_when: false
-      when: not setup_completed.stat.exists
+        echo "[$(date +%Y-%m-%d\ %H:%M:%S)] [INFO] Task: install Docker ({{ 'completed' if docker_install_result is defined and docker_install_result.changed|default(false) else 'skipped/failed' }})" >> {{ log_dir }}/{{ log_file }}
+        echo "OUTPUT: {{ docker_install_result.stdout|default('') }}" >> {{ log_dir }}/{{ log_file }}
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+      ignore_errors: true
 
-    # K8s repository
-    - name: Add Kubernetes repository
+    - name: Transfer Docker install logs
+      fetch:
+        src: "{{ log_dir }}/{{ log_file }}"
+        dest: "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        flat: yes
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      
+    - name: Append Docker install to host log
+      delegate_to: localhost
+      become: no
       shell: |
-        echo "deb [signed-by=/etc/apt/keyrings/kubernetes.gpg] https://pkgs.k8s.io/core:/stable:/v1.30/deb/ /" | tee /etc/apt/sources.list.d/kubernetes.list
-        exit 0
-      args:
-        creates: /etc/apt/sources.list.d/kubernetes.list
-      register: k8s_repo_added
-      changed_when: true
-      failed_when: false
-      when: not setup_completed.stat.exists
+        echo "\n[{{ ansible_date_time.iso8601 }}] Task: install Docker" >> "{{ host_combined_log }}"
+        if [ -f "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" ]; then
+          cat "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" >> "{{ host_combined_log }}"
+          rm "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        fi
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
 
-    - name: Update apt cache after adding K8s repo
-      shell: |
-        export DEBIAN_FRONTEND=noninteractive
-        timeout {{ apt_timeout }} apt-get update
-        exit 0
-      register: apt_update_k8s
-      changed_when: true
-      failed_when: false
-      when: k8s_repo_added.changed and not setup_completed.stat.exists
-
-    # K8s component installation
-    - name: Install Kubernetes components with timeout
-      shell: |
-        export DEBIAN_FRONTEND=noninteractive
-        timeout {{ apt_timeout }} apt-get -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" install -y kubelet kubeadm kubectl
-        exit 0
-      register: k8s_install_result
-      changed_when: true
-      failed_when: false
-      when: not setup_completed.stat.exists
-
-    - name: Hold Kubernetes packages at current version
-      shell: |
-        apt-mark hold kubelet kubeadm kubectl
-        exit 0
-      changed_when: true
-      failed_when: false
-      when: not setup_completed.stat.exists
-
-    # Docker configuration
-    - name: Create Docker configuration directory
-      file:
-        path: /etc/docker
-        state: directory
-        mode: '0755'
-      when: not setup_completed.stat.exists
-      failed_when: false
-
-    - name: Configure Docker to use systemd driver
+    - name: Configure Docker daemon
       copy:
         content: |
           {
@@ -274,55 +700,409 @@
             "storage-driver": "overlay2"
           }
         dest: /etc/docker/daemon.json
-      register: docker_config
+        owner: root
+        group: root
+        mode: '0644'
       when: not setup_completed.stat.exists
-      failed_when: false
+      register: docker_config_result
+      tags: docker_setup
 
-    - name: Restart Docker service
-      systemd:
+    # Log and transfer after configuring Docker
+    - name: Log configure Docker
+      shell: |
+        echo "[$(date +%Y-%m-%d\ %H:%M:%S)] [INFO] Task: configure Docker daemon ({{ 'completed' if docker_config_result is defined and docker_config_result.changed|default(false) else 'skipped/failed' }})" >> {{ log_dir }}/{{ log_file }}
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+      ignore_errors: true
+
+    - name: Transfer Docker config logs
+      fetch:
+        src: "{{ log_dir }}/{{ log_file }}"
+        dest: "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        flat: yes
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      
+    - name: Append Docker config to host log
+      delegate_to: localhost
+      become: no
+      shell: |
+        echo "\n[{{ ansible_date_time.iso8601 }}] Task: configure Docker daemon" >> "{{ host_combined_log }}"
+        if [ -f "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" ]; then
+          cat "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" >> "{{ host_combined_log }}"
+          rm "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        fi
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+
+    - name: Restart Docker
+      service:
         name: docker
         state: restarted
-        daemon_reload: yes
         enabled: yes
-      when: docker_config.changed and not setup_completed.stat.exists
-      failed_when: false
-
-    - name: Enable kubelet service
-      systemd:
-        name: kubelet
-        enabled: yes
-        daemon_reload: yes
       when: not setup_completed.stat.exists
-      failed_when: false
+      register: docker_restart_result
+      tags: docker_setup
 
-    # System configuration for k8s
+    # Log and transfer after restarting Docker
+    - name: Log restart Docker
+      shell: |
+        echo "[$(date +%Y-%m-%d\ %H:%M:%S)] [INFO] Task: restart Docker ({{ 'completed' if docker_restart_result is defined and docker_restart_result.changed|default(false) else 'skipped/failed' }})" >> {{ log_dir }}/{{ log_file }}
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+      ignore_errors: true
+
+    - name: Transfer Docker restart logs
+      fetch:
+        src: "{{ log_dir }}/{{ log_file }}"
+        dest: "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        flat: yes
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      
+    - name: Append Docker restart to host log
+      delegate_to: localhost
+      become: no
+      shell: |
+        echo "\n[{{ ansible_date_time.iso8601 }}] Task: restart Docker" >> "{{ host_combined_log }}"
+        if [ -f "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" ]; then
+          cat "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" >> "{{ host_combined_log }}"
+          rm "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        fi
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+
+    # Kubernetes installation
+    - name: Add Kubernetes GPG key
+      shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        chmod a+r /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        exit 0
+      changed_when: true
+      failed_when: false
+      when: not setup_completed.stat.exists
+      register: k8s_key_result
+      tags: kubernetes_setup
+
+    # Log and transfer after adding Kubernetes GPG key
+    - name: Log Kubernetes GPG key
+      shell: |
+        echo "[$(date +%Y-%m-%d\ %H:%M:%S)] [INFO] Task: add Kubernetes GPG key ({{ 'completed' if k8s_key_result is defined and k8s_key_result.changed|default(false) else 'skipped/failed' }})" >> {{ log_dir }}/{{ log_file }}
+        echo "OUTPUT: {{ k8s_key_result.stdout|default('') }}" >> {{ log_dir }}/{{ log_file }}
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+      ignore_errors: true
+
+    - name: Transfer K8s key logs
+      fetch:
+        src: "{{ log_dir }}/{{ log_file }}"
+        dest: "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        flat: yes
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      
+    - name: Append K8s key to host log
+      delegate_to: localhost
+      become: no
+      shell: |
+        echo "\n[{{ ansible_date_time.iso8601 }}] Task: add Kubernetes GPG key" >> "{{ host_combined_log }}"
+        if [ -f "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" ]; then
+          cat "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" >> "{{ host_combined_log }}"
+          rm "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        fi
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+
+    - name: Add Kubernetes repository
+      shell: |
+        echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.30/deb/ /" | tee /etc/apt/sources.list.d/kubernetes.list
+        exit 0
+      changed_when: true
+      failed_when: false
+      when: not setup_completed.stat.exists
+      register: k8s_repo_result
+      tags: kubernetes_setup
+
+    # Log and transfer after adding Kubernetes repository
+    - name: Log Kubernetes repository
+      shell: |
+        echo "[$(date +%Y-%m-%d\ %H:%M:%S)] [INFO] Task: add Kubernetes repository ({{ 'completed' if k8s_repo_result is defined and k8s_repo_result.changed|default(false) else 'skipped/failed' }})" >> {{ log_dir }}/{{ log_file }}
+        echo "OUTPUT: {{ k8s_repo_result.stdout|default('') }}" >> {{ log_dir }}/{{ log_file }}
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+      ignore_errors: true
+
+    - name: Transfer K8s repo logs
+      fetch:
+        src: "{{ log_dir }}/{{ log_file }}"
+        dest: "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        flat: yes
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      
+    - name: Append K8s repo to host log
+      delegate_to: localhost
+      become: no
+      shell: |
+        echo "\n[{{ ansible_date_time.iso8601 }}] Task: add Kubernetes repository" >> "{{ host_combined_log }}"
+        if [ -f "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" ]; then
+          cat "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" >> "{{ host_combined_log }}"
+          rm "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        fi
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+
+    - name: Update apt cache after adding Kubernetes repo
+      shell: |
+        export DEBIAN_FRONTEND=noninteractive
+        timeout {{ apt_timeout }} apt-get update
+        exit 0
+      changed_when: true
+      failed_when: false
+      when: not setup_completed.stat.exists
+      register: apt_update_k8s_result
+      tags: kubernetes_setup
+
+    # Log and transfer after updating apt cache for Kubernetes
+    - name: Log apt update K8s
+      shell: |
+        echo "[$(date +%Y-%m-%d\ %H:%M:%S)] [INFO] Task: update apt cache for Kubernetes ({{ 'completed' if apt_update_k8s_result is defined and apt_update_k8s_result.changed|default(false) else 'skipped/failed' }})" >> {{ log_dir }}/{{ log_file }}
+        echo "OUTPUT: {{ apt_update_k8s_result.stdout|default('') }}" >> {{ log_dir }}/{{ log_file }}
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+      ignore_errors: true
+
+    - name: Transfer K8s apt update logs
+      fetch:
+        src: "{{ log_dir }}/{{ log_file }}"
+        dest: "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        flat: yes
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      
+    - name: Append K8s apt update to host log
+      delegate_to: localhost
+      become: no
+      shell: |
+        echo "\n[{{ ansible_date_time.iso8601 }}] Task: update apt cache for Kubernetes" >> "{{ host_combined_log }}"
+        if [ -f "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" ]; then
+          cat "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" >> "{{ host_combined_log }}"
+          rm "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        fi
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+
+    - name: Install Kubernetes components
+      shell: |
+        export DEBIAN_FRONTEND=noninteractive
+        timeout {{ apt_timeout }} apt-get -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" install -y kubelet={{ kubernetes_version }} kubeadm={{ kubernetes_version }} kubectl={{ kubernetes_version }}
+        exit 0
+      changed_when: true
+      failed_when: false
+      when: not setup_completed.stat.exists
+      register: k8s_install_result
+      tags: kubernetes_setup
+
+    # Log and transfer after installing Kubernetes
+    - name: Log install Kubernetes
+      shell: |
+        echo "[$(date +%Y-%m-%d\ %H:%M:%S)] [INFO] Task: install Kubernetes components ({{ 'completed' if k8s_install_result is defined and k8s_install_result.changed|default(false) else 'skipped/failed' }})" >> {{ log_dir }}/{{ log_file }}
+        echo "OUTPUT: {{ k8s_install_result.stdout|default('') }}" >> {{ log_dir }}/{{ log_file }}
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+      ignore_errors: true
+
+    - name: Transfer K8s install logs
+      fetch:
+        src: "{{ log_dir }}/{{ log_file }}"
+        dest: "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        flat: yes
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      
+    - name: Append K8s install to host log
+      delegate_to: localhost
+      become: no
+      shell: |
+        echo "\n[{{ ansible_date_time.iso8601 }}] Task: install Kubernetes components" >> "{{ host_combined_log }}"
+        if [ -f "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" ]; then
+          cat "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" >> "{{ host_combined_log }}"
+          rm "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        fi
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+
+    - name: Hold Kubernetes packages
+      shell: |
+        apt-mark hold kubelet kubeadm kubectl
+        exit 0
+      changed_when: true
+      failed_when: false
+      when: not setup_completed.stat.exists
+      register: k8s_hold_result
+      tags: kubernetes_setup
+
+    # Log and transfer after holding Kubernetes packages
+    - name: Log hold Kubernetes packages
+      shell: |
+        echo "[$(date +%Y-%m-%d\ %H:%M:%S)] [INFO] Task: hold Kubernetes packages ({{ 'completed' if k8s_hold_result is defined and k8s_hold_result.changed|default(false) else 'skipped/failed' }})" >> {{ log_dir }}/{{ log_file }}
+        echo "OUTPUT: {{ k8s_hold_result.stdout|default('') }}" >> {{ log_dir }}/{{ log_file }}
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+      ignore_errors: true
+
+    - name: Transfer K8s hold logs
+      fetch:
+        src: "{{ log_dir }}/{{ log_file }}"
+        dest: "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        flat: yes
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      
+    - name: Append K8s hold to host log
+      delegate_to: localhost
+      become: no
+      shell: |
+        echo "\n[{{ ansible_date_time.iso8601 }}] Task: hold Kubernetes packages" >> "{{ host_combined_log }}"
+        if [ -f "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" ]; then
+          cat "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" >> "{{ host_combined_log }}"
+          rm "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        fi
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+
+    # System configuration
     - name: Disable swap
       shell: |
         swapoff -a
-        sed -i '/ swap / s/^/#/' /etc/fstab
+        sed -i '/swap/d' /etc/fstab
         exit 0
       changed_when: true
       failed_when: false
       when: not setup_completed.stat.exists
+      register: swap_result
+      tags: system_config
 
-    - name: Load overlay and br_netfilter modules
+    # Log and transfer after disabling swap
+    - name: Log disable swap
       shell: |
-        modprobe overlay || true
-        modprobe br_netfilter || true
+        echo "[$(date +%Y-%m-%d\ %H:%M:%S)] [INFO] Task: disable swap ({{ 'completed' if swap_result is defined and swap_result.changed|default(false) else 'skipped/failed' }})" >> {{ log_dir }}/{{ log_file }}
+        echo "OUTPUT: {{ swap_result.stdout|default('') }}" >> {{ log_dir }}/{{ log_file }}
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+      ignore_errors: true
+
+    - name: Transfer swap logs
+      fetch:
+        src: "{{ log_dir }}/{{ log_file }}"
+        dest: "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        flat: yes
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      
+    - name: Append swap to host log
+      delegate_to: localhost
+      become: no
+      shell: |
+        echo "\n[{{ ansible_date_time.iso8601 }}] Task: disable swap" >> "{{ host_combined_log }}"
+        if [ -f "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" ]; then
+          cat "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" >> "{{ host_combined_log }}"
+          rm "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        fi
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+
+    - name: Load kernel modules
+      shell: |
+        modprobe overlay
+        modprobe br_netfilter
         exit 0
       changed_when: true
       failed_when: false
       when: not setup_completed.stat.exists
+      register: modules_result
+      tags: system_config
 
-    - name: Configure kernel parameters for Kubernetes
+    # Log and transfer after loading kernel modules
+    - name: Log load kernel modules
+      shell: |
+        echo "[$(date +%Y-%m-%d\ %H:%M:%S)] [INFO] Task: load kernel modules ({{ 'completed' if modules_result is defined and modules_result.changed|default(false) else 'skipped/failed' }})" >> {{ log_dir }}/{{ log_file }}
+        echo "OUTPUT: {{ modules_result.stdout|default('') }}" >> {{ log_dir }}/{{ log_file }}
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+      ignore_errors: true
+
+    - name: Transfer modules logs
+      fetch:
+        src: "{{ log_dir }}/{{ log_file }}"
+        dest: "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        flat: yes
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      
+    - name: Append modules to host log
+      delegate_to: localhost
+      become: no
+      shell: |
+        echo "\n[{{ ansible_date_time.iso8601 }}] Task: load kernel modules" >> "{{ host_combined_log }}"
+        if [ -f "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" ]; then
+          cat "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" >> "{{ host_combined_log }}"
+          rm "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        fi
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+
+    - name: Configure kernel parameters
       copy:
         content: |
-          net.bridge.bridge-nf-call-iptables  = 1
+          net.bridge.bridge-nf-call-iptables = 1
           net.bridge.bridge-nf-call-ip6tables = 1
-          net.ipv4.ip_forward                 = 1
+          net.ipv4.ip_forward = 1
         dest: /etc/sysctl.d/k8s.conf
+        owner: root
+        group: root
+        mode: '0644'
       when: not setup_completed.stat.exists
-      failed_when: false
+      register: sysctl_result
+      tags: system_config
+
+    # Log and transfer after configuring kernel parameters
+    - name: Log configure kernel parameters
+      shell: |
+        echo "[$(date +%Y-%m-%d\ %H:%M:%S)] [INFO] Task: configure kernel parameters ({{ 'completed' if sysctl_result is defined and sysctl_result.changed|default(false) else 'skipped/failed' }})" >> {{ log_dir }}/{{ log_file }}
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+      ignore_errors: true
+
+    - name: Transfer sysctl logs
+      fetch:
+        src: "{{ log_dir }}/{{ log_file }}"
+        dest: "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        flat: yes
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      
+    - name: Append sysctl to host log
+      delegate_to: localhost
+      become: no
+      shell: |
+        echo "\n[{{ ansible_date_time.iso8601 }}] Task: configure kernel parameters" >> "{{ host_combined_log }}"
+        if [ -f "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" ]; then
+          cat "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" >> "{{ host_combined_log }}"
+          rm "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        fi
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
 
     - name: Apply kernel parameters
       shell: |
@@ -331,92 +1111,346 @@
       changed_when: true
       failed_when: false
       when: not setup_completed.stat.exists
+      register: sysctl_apply_result
+      tags: system_config
 
-    # Initialize master node
-    - name: Check if kubernetes is already initialized
-      stat:
-        path: /etc/kubernetes/admin.conf
-      register: k8s_initialized
-      when: "'master' in node_role"
+    # Log and transfer after applying kernel parameters
+    - name: Log apply kernel parameters
+      shell: |
+        echo "[$(date +%Y-%m-%d\ %H:%M:%S)] [INFO] Task: apply kernel parameters ({{ 'completed' if sysctl_apply_result is defined and sysctl_apply_result.changed|default(false) else 'skipped/failed' }})" >> {{ log_dir }}/{{ log_file }}
+        echo "OUTPUT: {{ sysctl_apply_result.stdout|default('') }}" >> {{ log_dir }}/{{ log_file }}
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+      ignore_errors: true
 
+    - name: Transfer sysctl apply logs
+      fetch:
+        src: "{{ log_dir }}/{{ log_file }}"
+        dest: "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        flat: yes
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+
+    - name: Append sysctl apply to host log
+      delegate_to: localhost
+      become: no
+      shell: |
+        echo "\n[{{ ansible_date_time.iso8601 }}] Task: apply kernel parameters" >> "{{ host_combined_log }}"
+        if [ -f "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" ]; then
+          cat "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" >> "{{ host_combined_log }}"
+          rm "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        fi
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+
+    # Kubernetes cluster initialization (master only)
     - name: Initialize Kubernetes master
       shell: |
-        kubeadm init --pod-network-cidr=10.244.0.0/16
-        exit $?
+        kubeadm init --pod-network-cidr=10.244.0.0/16 --apiserver-advertise-address={{ ansible_default_ipv4.address }}
+        exit 0
       register: kubeadm_init
-      when: "'master' in node_role and not k8s_initialized.stat.exists|default(false) and not setup_completed.stat.exists"
-      failed_when: false
+      when:
+        - inventory_hostname == groups['kubernetes'][0]
+        - not setup_completed.stat.exists
+      tags: master_init
 
-    - name: Create .kube directory for ubuntu user
+    # Log and transfer after initializing master
+    - name: Log initialize master
+      shell: |
+        echo "[$(date +%Y-%m-%d\ %H:%M:%S)] [INFO] Task: initialize Kubernetes master ({{ 'completed' if kubeadm_init is defined and kubeadm_init.rc == 0 else 'skipped/failed' }})" >> {{ log_dir }}/{{ log_file }}
+        echo "OUTPUT: {{ kubeadm_init.stdout|default('') }}" >> {{ log_dir }}/{{ log_file }}
+      when:
+        - log_enabled and not setup_completed.stat.exists
+        - inventory_hostname == groups['kubernetes'][0]
+      changed_when: false
+      ignore_errors: true
+
+    - name: Transfer master init logs
+      fetch:
+        src: "{{ log_dir }}/{{ log_file }}"
+        dest: "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        flat: yes
+      ignore_errors: true
+      when:
+        - log_enabled and not setup_completed.stat.exists
+        - inventory_hostname == groups['kubernetes'][0]
+
+    - name: Append master init to host log
+      delegate_to: localhost
+      become: no
+      shell: |
+        echo "\n[{{ ansible_date_time.iso8601 }}] Task: initialize Kubernetes master" >> "{{ host_combined_log }}"
+        if [ -f "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" ]; then
+          cat "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" >> "{{ host_combined_log }}"
+          rm "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        fi
+      ignore_errors: true
+      when:
+        - log_enabled and not setup_completed.stat.exists
+        - inventory_hostname == groups['kubernetes'][0]
+      changed_when: false
+
+    - name: Create .kube directory for root
       file:
-        path: /home/ubuntu/.kube
+        path: /root/.kube
         state: directory
-        owner: ubuntu
-        group: ubuntu
+        owner: root
+        group: root
         mode: '0755'
-      when: "'master' in node_role and not setup_completed.stat.exists"
-      failed_when: false
+      when:
+        - inventory_hostname == groups['kubernetes'][0]
+        - not setup_completed.stat.exists
+        - kubeadm_init is defined and kubeadm_init.rc == 0
+      register: kube_dir_result
+      tags: master_init
 
-    - name: Copy kube config to ubuntu user
+    - name: Copy admin.conf to root's kube config
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /root/.kube/config
+        owner: root
+        group: root
+        mode: '0644'
+        remote_src: yes
+      when:
+        - inventory_hostname == groups['kubernetes'][0]
+        - not setup_completed.stat.exists
+        - kubeadm_init is defined and kubeadm_init.rc == 0
+      register: kube_config_result
+      tags: master_init
+
+    - name: Install Flannel network
       shell: |
-        if [ -f /etc/kubernetes/admin.conf ]; then
-          mkdir -p /home/ubuntu/.kube
-          cp -f /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
-          chown -R ubuntu:ubuntu /home/ubuntu/.kube
-          chmod 0600 /home/ubuntu/.kube/config
-        fi
+        kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
         exit 0
-      changed_when: true
-      failed_when: false
-      when: "'master' in node_role and not setup_completed.stat.exists"
+      when:
+        - inventory_hostname == groups['kubernetes'][0]
+        - not setup_completed.stat.exists
+        - kubeadm_init is defined and kubeadm_init.rc == 0
+      register: flannel_result
+      tags: master_init
 
-    # Install Flannel
-    - name: Install Flannel network plugin
+    - name: Get join command
       shell: |
-        export KUBECONFIG=/home/ubuntu/.kube/config
-        sudo -u ubuntu kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml || true
+        kubeadm token create --print-join-command
         exit 0
-      changed_when: true
-      failed_when: false
-      when: "'master' in node_role and not setup_completed.stat.exists"
+      register: join_command_raw
+      when:
+        - inventory_hostname == groups['kubernetes'][0]
+        - not setup_completed.stat.exists
+        - kubeadm_init is defined and kubeadm_init.rc == 0
+      tags: master_init
 
-    # Join worker nodes
-    - name: Get join command from master
-      shell: |
-        if [ -f /etc/kubernetes/admin.conf ]; then
-          kubeadm token create --print-join-command
-        else
-          echo "Master not initialized"
-          exit 1
-        fi
-      register: join_command
-      when: "'master' in node_role and not setup_completed.stat.exists"
-      failed_when: false
-      delegate_to: master
-
-    - name: Set fact with join command
+    - name: Set join command fact
       set_fact:
-        kubernetes_join_command: "{{ join_command.stdout }}"
-      when: join_command is defined and join_command.stdout is defined and join_command.stdout != "Master not initialized"
-      failed_when: false
+        join_command: "{{ join_command_raw.stdout }}"
+      when:
+        - inventory_hostname == groups['kubernetes'][0]
+        - not setup_completed.stat.exists
+        - join_command_raw is defined and join_command_raw.rc == 0
+      tags: master_init
 
-    - name: Check if node is already joined
-      stat:
-        path: /etc/kubernetes/kubelet.conf
-      register: kubelet_conf
-      when: "'worker' in node_role"
+    - name: Share join command with other hosts
+      set_fact:
+        join_command: "{{ hostvars[groups['kubernetes'][0]].join_command }}"
+      when:
+        - inventory_hostname != groups['kubernetes'][0]
+        - not setup_completed.stat.exists
+        - hostvars[groups['kubernetes'][0]].join_command is defined
+      tags: worker_join
 
-    - name: Join worker nodes to cluster
+    # Worker nodes join the cluster
+    - name: Join cluster
       shell: |
-        {{ hostvars['localhost']['kubernetes_join_command'] }}
-        exit $?
-      when: "'worker' in node_role and not kubelet_conf.stat.exists|default(false) and hostvars['localhost']['kubernetes_join_command'] is defined and not setup_completed.stat.exists"
-      failed_when: false
+        {{ join_command }}
+        exit 0
+      register: join_result
+      when:
+        - inventory_hostname != groups['kubernetes'][0]
+        - not setup_completed.stat.exists
+        - join_command is defined
+      tags: worker_join
 
-    # Mark setup as completed
-    - name: Create setup completion flag
+    # Log and transfer after joining cluster
+    - name: Log join cluster
+      shell: |
+        echo "[$(date +%Y-%m-%d\ %H:%M:%S)] [INFO] Task: join cluster ({{ 'completed' if join_result is defined and join_result.rc == 0 else 'skipped/failed' }})" >> {{ log_dir }}/{{ log_file }}
+        echo "OUTPUT: {{ join_result.stdout|default('') }}" >> {{ log_dir }}/{{ log_file }}
+      when:
+        - log_enabled and not setup_completed.stat.exists
+        - inventory_hostname != groups['kubernetes'][0]
+        - join_command is defined
+      changed_when: false
+      ignore_errors: true
+
+    - name: Transfer join logs
+      fetch:
+        src: "{{ log_dir }}/{{ log_file }}"
+        dest: "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        flat: yes
+      ignore_errors: true
+      when:
+        - log_enabled and not setup_completed.stat.exists
+        - inventory_hostname != groups['kubernetes'][0]
+        - join_command is defined
+
+    - name: Append join to host log
+      delegate_to: localhost
+      become: no
+      shell: |
+        echo "\n[{{ ansible_date_time.iso8601 }}] Task: join cluster" >> "{{ host_combined_log }}"
+        if [ -f "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" ]; then
+          cat "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" >> "{{ host_combined_log }}"
+          rm "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        fi
+      ignore_errors: true
+      when:
+        - log_enabled and not setup_completed.stat.exists
+        - inventory_hostname != groups['kubernetes'][0]
+        - join_command is defined
+      changed_when: false
+
+    # Mark as completed
+    - name: Mark setup as completed
       file:
         path: "{{ setup_completed_file }}"
         state: touch
         mode: '0644'
-      failed_when: false
+      when: not setup_completed.stat.exists
+      register: mark_complete_result
+      tags: finalize
+
+    # Log and transfer after marking setup complete
+    - name: Log mark complete
+      shell: |
+        echo "[$(date +%Y-%m-%d\ %H:%M:%S)] [INFO] Task: mark setup as completed ({{ 'completed' if mark_complete_result is defined and mark_complete_result.changed|default(false) else 'skipped/failed' }})" >> {{ log_dir }}/{{ log_file }}
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+      ignore_errors: true
+
+    - name: Transfer mark complete logs
+      fetch:
+        src: "{{ log_dir }}/{{ log_file }}"
+        dest: "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        flat: yes
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+
+    - name: Append mark complete to host log
+      delegate_to: localhost
+      become: no
+      shell: |
+        echo "\n[{{ ansible_date_time.iso8601 }}] Task: mark setup as completed" >> "{{ host_combined_log }}"
+        if [ -f "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" ]; then
+          cat "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log" >> "{{ host_combined_log }}"
+          rm "{{ local_log_dir }}/temp-{{ inventory_hostname }}.log"
+        fi
+      ignore_errors: true
+      when: log_enabled and not setup_completed.stat.exists
+      changed_when: false
+
+  post_tasks:
+    # Finalize the log file
+    - name: Finalize log
+      shell: |
+        echo "\n==================================================================" >> {{ log_dir }}/{{ log_file }}
+        echo "Kubernetes setup completed on {{ inventory_hostname }}" >> {{ log_dir }}/{{ log_file }}
+        echo "Completed: $(date)" >> {{ log_dir }}/{{ log_file }}
+        echo "==================================================================" >> {{ log_dir }}/{{ log_file }}
+      when: log_enabled
+      changed_when: false
+      ignore_errors: true
+
+    # Final log transfer
+    - name: Final log transfer
+      fetch:
+        src: "{{ log_dir }}/{{ log_file }}"
+        dest: "{{ local_log_dir }}/temp-{{ inventory_hostname }}-final.log"
+        flat: yes
+      ignore_errors: true
+      when: log_enabled
+
+    - name: Append final to host log
+      delegate_to: localhost
+      become: no
+      shell: |
+        echo "\n[{{ ansible_date_time.iso8601 }}] Task: finalize logs" >> "{{ host_combined_log }}"
+        if [ -f "{{ local_log_dir }}/temp-{{ inventory_hostname }}-final.log" ]; then
+          cat "{{ local_log_dir }}/temp-{{ inventory_hostname }}-final.log" >> "{{ host_combined_log }}"
+          rm "{{ local_log_dir }}/temp-{{ inventory_hostname }}-final.log"
+        fi
+      ignore_errors: true
+      when: log_enabled
+      changed_when: false
+
+    # Add completion message to host log
+    - name: Add completion message to host log
+      delegate_to: localhost
+      become: no
+      shell: |
+        echo "\n=================================================================" >> "{{ host_combined_log }}"
+        echo "Kubernetes setup completed on {{ inventory_hostname }}" >> "{{ host_combined_log }}"
+        echo "Completed: {{ ansible_date_time.iso8601 }}" >> "{{ host_combined_log }}"
+        echo "=================================================================" >> "{{ host_combined_log }}"
+      when: log_enabled
+      changed_when: false
+
+    # Combine all logs into a single file (master only)
+    - name: Create combined log directory
+      delegate_to: localhost
+      become: no
+      file:
+        path: "{{ local_log_dir }}/combined"
+        state: directory
+        mode: '0755'
+      when:
+        - inventory_hostname == groups['kubernetes'][0]
+        - log_enabled
+      run_once: true
+
+    - name: Combine all host logs
+      delegate_to: localhost
+      become: no
+      shell: |
+        echo "Combining logs from all hosts at $(date)" > {{ local_log_dir }}/combined/all-hosts-combined.log
+        for log in {{ local_log_dir }}/host-*-combined.log; do
+          if [ -f "$log" ]; then
+            echo "\n\n===== $(basename $log) =====" >> {{ local_log_dir }}/combined/all-hosts-combined.log
+            cat "$log" >> {{ local_log_dir }}/combined/all-hosts-combined.log
+          fi
+        done
+        echo "\n\nLog combination completed at $(date)" >> {{ local_log_dir }}/combined/all-hosts-combined.log
+      when:
+        - inventory_hostname == groups['kubernetes'][0]
+        - log_enabled
+      run_once: true
+      changed_when: false
+
+    # Display available log files
+    - name: Display available log files
+      delegate_to: localhost
+      become: no
+      find:
+        paths: "{{ local_log_dir }}"
+        patterns: "*.log"
+        recurse: yes
+      register: log_files
+      run_once: true
+      when:
+        - inventory_hostname == groups['kubernetes'][0]
+        - log_enabled
+      changed_when: false
+
+    - name: Display log file information
+      debug:
+        msg:
+          - "Individual host log files available:"
+          - "{{ log_files.files | map(attribute='path') | map('regex_replace', '^.*/', './logs/') | list }}"
+          - ""
+          - "Combined log file: ./logs/combined/all-hosts-combined.log"
+      when:
+        - inventory_hostname == groups['kubernetes'][0]
+        - log_enabled
+        - log_files is defined and log_files.files is defined
+      run_once: true
