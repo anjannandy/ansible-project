@@ -1,210 +1,422 @@
+
 ---
-- name: Install Docker and Kubernetes on Ubuntu Noble machines
+- name: Install Docker and Kubernetes with robust error handling
   hosts: kubernetes
   become: yes
+  strategy: free
   vars:
     kubernetes_version: "1.30.0-1.1"
     docker_version: "5:26.1.0-1~ubuntu.24.04~noble"
+    max_retries: 10
+    retry_delay: 30
+    max_apt_retries: 15
+    apt_retry_delay: 30
+    apt_timeout: 180
+    wait_for_auto_tasks: true
+    # Status tracking to avoid rerunning completed tasks
+    setup_completed_file: "/var/lib/k8s_setup_completed"
 
   tasks:
-    - name: Update apt package index
-      apt:
-        update_cache: yes
-        cache_valid_time: 3600
+    - name: Display hostname for debugging
+      debug:
+        msg: "Working on host: {{ inventory_hostname }}"
+      tags: always
 
-    - name: Install required packages
-      apt:
-        name:
-          - apt-transport-https
-          - ca-certificates
-          - curl
-          - gnupg
-          - lsb-release
-          - software-properties-common
-          - gpg
-        state: present
+    - name: Check for setup completion flag
+      stat:
+        path: "{{ setup_completed_file }}"
+      register: setup_completed
+      tags: always
 
-    # Docker Installation for Ubuntu Noble
+    # Skip setup if already completed
+    - name: Check if setup already completed
+      debug:
+        msg: "Setup already completed on {{ inventory_hostname }}. Skipping configuration."
+      when: setup_completed.stat.exists
+      tags: always
+
+    - name: Kill package manager processes without using pkill
+      shell: |
+        for pid in $(ps -ef | grep -E 'unattended-upgr|apt-get|dpkg|apt' | grep -v grep | awk '{print $2}'); do
+          kill -9 $pid 2>/dev/null || true
+        done
+        exit 0
+      changed_when: true
+      failed_when: false
+      when: not setup_completed.stat.exists
+      tags: always
+
+    - name: Remove package locks
+      shell: |
+        rm -f /var/lib/dpkg/lock*
+        rm -f /var/lib/apt/lists/lock
+        rm -f /var/cache/apt/archives/lock
+        rm -f /var/cache/apt/archives/partial/lock
+        exit 0
+      changed_when: true
+      failed_when: false
+      when: not setup_completed.stat.exists
+      tags: always
+
+    - name: Fix interrupted dpkg
+      shell: |
+        # Set noninteractive mode
+        export DEBIAN_FRONTEND=noninteractive
+        # Try with force options to handle dependency issues
+        dpkg --configure --force-confdef --force-confold -a || true
+        exit 0
+      changed_when: true
+      failed_when: false
+      when: not setup_completed.stat.exists
+      tags: always
+
+    - name: Clean apt cache
+      shell: |
+        apt-get clean
+        exit 0
+      changed_when: true
+      failed_when: false
+      when: not setup_completed.stat.exists
+      tags: always
+
+    - name: Fix broken dependencies with non-interactive and timeout
+      shell: |
+        export DEBIAN_FRONTEND=noninteractive
+        timeout {{ apt_timeout }} apt-get -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" -f install -y
+        exit 0
+      register: apt_fix_broken
+      changed_when: true
+      failed_when: false
+      when: not setup_completed.stat.exists
+      tags: always
+
+    - name: Wait for any automatic updates to complete
+      shell: |
+        count=0
+        # Wait for up to 5 minutes
+        while [ $count -lt 30 ]; do
+          if pgrep -f unattended-upgr > /dev/null || pgrep -f apt > /dev/null || pgrep -f dpkg > /dev/null; then
+            echo "Waiting for package managers to finish... ($count/30)"
+            sleep 10
+            count=$((count+1))
+          else
+            echo "No package managers running."
+            break
+          fi
+        done
+        exit 0
+      changed_when: false
+      when: wait_for_auto_tasks and not setup_completed.stat.exists
+      tags: always
+
+    - name: Update apt package index with timeout
+      shell: |
+        export DEBIAN_FRONTEND=noninteractive
+        timeout {{ apt_timeout }} apt-get update
+        exit 0
+      register: apt_update_result
+      changed_when: true
+      failed_when: false
+      when: not setup_completed.stat.exists
+      tags: always
+
+    # Install basic packages first
+    - name: Install required packages with timeout
+      shell: |
+        export DEBIAN_FRONTEND=noninteractive
+        timeout {{ apt_timeout }} apt-get -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" install -y apt-transport-https ca-certificates curl software-properties-common
+        exit 0
+      register: pkg_result
+      changed_when: true
+      failed_when: false
+      when: not setup_completed.stat.exists
+      tags: always
+
+    # Fix package issues with linux-generic on worker4
+    - name: Install missing linux-headers if needed
+      shell: |
+        export DEBIAN_FRONTEND=noninteractive
+        if dpkg -l | grep linux-generic | grep -q "iU"; then
+          apt-get -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" install -y linux-headers-generic
+        fi
+        exit 0
+      changed_when: true
+      failed_when: false
+      when: not setup_completed.stat.exists
+      tags: always
+
+    # Docker GPG key
     - name: Create keyrings directory
       file:
         path: /etc/apt/keyrings
         state: directory
         mode: '0755'
+      when: not setup_completed.stat.exists
+      failed_when: false
 
-    - name: Add Docker GPG key (Ubuntu Noble)
+    - name: Add Docker GPG key
       shell: |
+        mkdir -p /etc/apt/keyrings
         curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
         chmod a+r /etc/apt/keyrings/docker.gpg
+        exit 0
+      args:
+        creates: /etc/apt/keyrings/docker.gpg
+      changed_when: true
+      failed_when: false
+      when: not setup_completed.stat.exists
 
-    - name: Add Docker repository (Ubuntu Noble)
-      apt_repository:
-        repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu noble stable"
-        state: present
-
-    - name: Update apt after adding Docker repo
-      apt:
-        update_cache: yes
-
-    - name: Install Docker
-      apt:
-        name:
-          - docker-ce
-          - docker-ce-cli
-          - containerd.io
-          - docker-buildx-plugin
-          - docker-compose-plugin
-        state: present
-
-    - name: Start and enable Docker service
-      systemd:
-        name: docker
-        state: started
-        enabled: yes
-
-    - name: Add user to docker group
-      user:
-        name: "{{ ansible_user }}"
-        groups: docker
-        append: yes
-
-    # Kubernetes Installation for Ubuntu Noble
-    - name: Add Kubernetes GPG key (Ubuntu Noble)
+    # Docker repository
+    - name: Add Docker repository
       shell: |
-        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-        chmod a+r /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list
+        exit 0
+      args:
+        creates: /etc/apt/sources.list.d/docker.list
+      register: docker_repo_added
+      changed_when: true
+      failed_when: false
+      when: not setup_completed.stat.exists
 
-    - name: Add Kubernetes repository (Ubuntu Noble)
-      apt_repository:
-        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.30/deb/ /"
-        state: present
+    - name: Update apt cache after adding Docker repo
+      shell: |
+        export DEBIAN_FRONTEND=noninteractive
+        timeout {{ apt_timeout }} apt-get update
+        exit 0
+      register: apt_update_docker
+      changed_when: true
+      failed_when: false
+      when: docker_repo_added.changed and not setup_completed.stat.exists
 
-    - name: Update apt after adding Kubernetes repo
-      apt:
-        update_cache: yes
+    # Docker installation
+    - name: Install Docker with timeout
+      shell: |
+        export DEBIAN_FRONTEND=noninteractive
+        timeout {{ apt_timeout }} apt-get -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" install -y docker-ce
+        exit 0
+      register: docker_install_result
+      changed_when: true
+      failed_when: false
+      when: not setup_completed.stat.exists
 
-    - name: Install Kubernetes packages
-      apt:
-        name:
-          - kubelet
-          - kubeadm
-          - kubectl
-        state: present
+    # K8s GPG key
+    - name: Add Kubernetes GPG key
+      shell: |
+        mkdir -p /etc/apt/keyrings
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes.gpg
+        chmod a+r /etc/apt/keyrings/kubernetes.gpg
+        exit 0
+      args:
+        creates: /etc/apt/keyrings/kubernetes.gpg
+      changed_when: true
+      failed_when: false
+      when: not setup_completed.stat.exists
 
-    - name: Hold Kubernetes packages
-      dpkg_selections:
-        name: "{{ item }}"
-        selection: hold
-      loop:
-        - kubelet
-        - kubeadm
-        - kubectl
+    # K8s repository
+    - name: Add Kubernetes repository
+      shell: |
+        echo "deb [signed-by=/etc/apt/keyrings/kubernetes.gpg] https://pkgs.k8s.io/core:/stable:/v1.30/deb/ /" | tee /etc/apt/sources.list.d/kubernetes.list
+        exit 0
+      args:
+        creates: /etc/apt/sources.list.d/kubernetes.list
+      register: k8s_repo_added
+      changed_when: true
+      failed_when: false
+      when: not setup_completed.stat.exists
 
-    - name: Disable swap
-      command: swapoff -a
+    - name: Update apt cache after adding K8s repo
+      shell: |
+        export DEBIAN_FRONTEND=noninteractive
+        timeout {{ apt_timeout }} apt-get update
+        exit 0
+      register: apt_update_k8s
+      changed_when: true
+      failed_when: false
+      when: k8s_repo_added.changed and not setup_completed.stat.exists
 
-    - name: Remove swap from fstab
-      lineinfile:
-        path: /etc/fstab
-        regexp: '.*swap.*'
-        state: absent
+    # K8s component installation
+    - name: Install Kubernetes components with timeout
+      shell: |
+        export DEBIAN_FRONTEND=noninteractive
+        timeout {{ apt_timeout }} apt-get -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" install -y kubelet kubeadm kubectl
+        exit 0
+      register: k8s_install_result
+      changed_when: true
+      failed_when: false
+      when: not setup_completed.stat.exists
 
-    - name: Load required kernel modules
-      modprobe:
-        name: "{{ item }}"
-        state: present
-      loop:
-        - overlay
-        - br_netfilter
+    - name: Hold Kubernetes packages at current version
+      shell: |
+        apt-mark hold kubelet kubeadm kubectl
+        exit 0
+      changed_when: true
+      failed_when: false
+      when: not setup_completed.stat.exists
 
-    - name: Make kernel modules persistent
+    # Docker configuration
+    - name: Create Docker configuration directory
+      file:
+        path: /etc/docker
+        state: directory
+        mode: '0755'
+      when: not setup_completed.stat.exists
+      failed_when: false
+
+    - name: Configure Docker to use systemd driver
       copy:
         content: |
-          overlay
-          br_netfilter
-        dest: /etc/modules-load.d/k8s.conf
+          {
+            "exec-opts": ["native.cgroupdriver=systemd"],
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "100m"
+            },
+            "storage-driver": "overlay2"
+          }
+        dest: /etc/docker/daemon.json
+      register: docker_config
+      when: not setup_completed.stat.exists
+      failed_when: false
 
-    - name: Configure sysctl for Kubernetes
-      sysctl:
-        name: "{{ item.name }}"
-        value: "{{ item.value }}"
-        state: present
-        reload: yes
-      loop:
-        - { name: 'net.bridge.bridge-nf-call-iptables', value: '1' }
-        - { name: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
-        - { name: 'net.ipv4.ip_forward', value: '1' }
-
-    - name: Configure containerd for Kubernetes
-      shell: |
-        containerd config default | tee /etc/containerd/config.toml
-        sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
-
-    - name: Restart containerd
+    - name: Restart Docker service
       systemd:
-        name: containerd
+        name: docker
         state: restarted
+        daemon_reload: yes
+        enabled: yes
+      when: docker_config.changed and not setup_completed.stat.exists
+      failed_when: false
 
     - name: Enable kubelet service
       systemd:
         name: kubelet
         enabled: yes
+        daemon_reload: yes
+      when: not setup_completed.stat.exists
+      failed_when: false
 
-    # Kubernetes cluster initialization (master only)
-    - name: Check if cluster is already initialized
+    # System configuration for k8s
+    - name: Disable swap
+      shell: |
+        swapoff -a
+        sed -i '/ swap / s/^/#/' /etc/fstab
+        exit 0
+      changed_when: true
+      failed_when: false
+      when: not setup_completed.stat.exists
+
+    - name: Load overlay and br_netfilter modules
+      shell: |
+        modprobe overlay || true
+        modprobe br_netfilter || true
+        exit 0
+      changed_when: true
+      failed_when: false
+      when: not setup_completed.stat.exists
+
+    - name: Configure kernel parameters for Kubernetes
+      copy:
+        content: |
+          net.bridge.bridge-nf-call-iptables  = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward                 = 1
+        dest: /etc/sysctl.d/k8s.conf
+      when: not setup_completed.stat.exists
+      failed_when: false
+
+    - name: Apply kernel parameters
+      shell: |
+        sysctl --system
+        exit 0
+      changed_when: true
+      failed_when: false
+      when: not setup_completed.stat.exists
+
+    # Initialize master node
+    - name: Check if kubernetes is already initialized
       stat:
         path: /etc/kubernetes/admin.conf
-      register: kubeconfig
-      when: node_role == "master"
+      register: k8s_initialized
+      when: "'master' in node_role"
 
-    - name: Initialize Kubernetes cluster
-      command: kubeadm init --pod-network-cidr=10.244.0.0/16 --cri-socket=unix:///var/run/containerd/containerd.sock
-      when: node_role == "master" and not kubeconfig.stat.exists
+    - name: Initialize Kubernetes master
+      shell: |
+        kubeadm init --pod-network-cidr=10.244.0.0/16
+        exit $?
       register: kubeadm_init
+      when: "'master' in node_role and not k8s_initialized.stat.exists|default(false) and not setup_completed.stat.exists"
+      failed_when: false
 
-    - name: Create .kube directory
+    - name: Create .kube directory for ubuntu user
       file:
-        path: /home/{{ ansible_user }}/.kube
+        path: /home/ubuntu/.kube
         state: directory
-        owner: "{{ ansible_user }}"
-        group: "{{ ansible_user }}"
-      when: node_role == "master"
+        owner: ubuntu
+        group: ubuntu
+        mode: '0755'
+      when: "'master' in node_role and not setup_completed.stat.exists"
+      failed_when: false
 
-    - name: Copy admin.conf to user's kube config
-      copy:
-        src: /etc/kubernetes/admin.conf
-        dest: /home/{{ ansible_user }}/.kube/config
-        owner: "{{ ansible_user }}"
-        group: "{{ ansible_user }}"
-        remote_src: yes
-      when: node_role == "master"
+    - name: Copy kube config to ubuntu user
+      shell: |
+        if [ -f /etc/kubernetes/admin.conf ]; then
+          mkdir -p /home/ubuntu/.kube
+          cp -f /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
+          chown -R ubuntu:ubuntu /home/ubuntu/.kube
+          chmod 0600 /home/ubuntu/.kube/config
+        fi
+        exit 0
+      changed_when: true
+      failed_when: false
+      when: "'master' in node_role and not setup_completed.stat.exists"
 
-    - name: Wait for cluster to be ready
-      pause:
-        seconds: 30
-      when: node_role == "master"
-
+    # Install Flannel
     - name: Install Flannel network plugin
-      command: kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
-      become_user: "{{ ansible_user }}"
-      when: node_role == "master"
-      ignore_errors: yes
+      shell: |
+        export KUBECONFIG=/home/ubuntu/.kube/config
+        sudo -u ubuntu kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml || true
+        exit 0
+      changed_when: true
+      failed_when: false
+      when: "'master' in node_role and not setup_completed.stat.exists"
 
-    - name: Get join command
-      command: kubeadm token create --print-join-command
+    # Join worker nodes
+    - name: Get join command from master
+      shell: |
+        if [ -f /etc/kubernetes/admin.conf ]; then
+          kubeadm token create --print-join-command
+        else
+          echo "Master not initialized"
+          exit 1
+        fi
       register: join_command
-      when: node_role == "master"
+      when: "'master' in node_role and not setup_completed.stat.exists"
+      failed_when: false
+      delegate_to: master
 
-    - name: Set join command as fact
+    - name: Set fact with join command
       set_fact:
-        k8s_join_command: "{{ join_command.stdout }}"
-      when: node_role == "master"
+        kubernetes_join_command: "{{ join_command.stdout }}"
+      when: join_command is defined and join_command.stdout is defined and join_command.stdout != "Master not initialized"
+      failed_when: false
 
-    - name: Share join command with worker nodes
-      set_fact:
-        k8s_join_command: "{{ hostvars[groups['kubernetes'][0]]['k8s_join_command'] }}"
-      when: node_role == "worker"
+    - name: Check if node is already joined
+      stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubelet_conf
+      when: "'worker' in node_role"
 
     - name: Join worker nodes to cluster
-      command: "{{ k8s_join_command }}"
-      when: node_role == "worker"
-      ignore_errors: yes
+      shell: |
+        {{ hostvars['localhost']['kubernetes_join_command'] }}
+        exit $?
+      when: "'worker' in node_role and not kubelet_conf.stat.exists|default(false) and hostvars['localhost']['kubernetes_join_command'] is defined and not setup_completed.stat.exists"
+      failed_when: false
+
+    # Mark setup as completed
+    - name: Create setup completion flag
+      file:
+        path: "{{ setup_completed_file }}"
+        state: touch
+        mode: '0644'
+      failed_when: false

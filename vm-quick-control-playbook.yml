@@ -1,0 +1,49 @@
+---
+- name: Quick VM Control
+  hosts: localhost
+  gather_facts: no
+  vars:
+    vbox_host: "192.168.1.200"
+    vbox_user: "anandy"
+    action: "{{ vm_action | default('status') }}"
+    vm_names:
+      - "ub-server-01"
+      - "ub-server-02"
+      - "ub-server-03"
+      - "ub-server-04"
+      - "ub-server-05"
+
+  tasks:
+    - name: "{{ action | upper }} all VMs"
+      delegate_to: "{{ vbox_host }}"
+      vars:
+        ansible_user: "{{ vbox_user }}"
+      block:
+        - name: Get VM status
+          command: VBoxManage list runningvms
+          register: running_vms
+
+        - name: Start VMs
+          command: VBoxManage startvm "{{ item }}" --type headless
+          loop: "{{ vm_names }}"
+          when: action == 'start' and item not in running_vms.stdout
+          ignore_errors: yes
+
+        - name: Stop VMs
+          command: VBoxManage controlvm "{{ item }}" acpipowerbutton
+          loop: "{{ vm_names }}"
+          when: action == 'stop' and item in running_vms.stdout
+          ignore_errors: yes
+
+        - name: Force stop VMs
+          command: VBoxManage controlvm "{{ item }}" poweroff
+          loop: "{{ vm_names }}"
+          when: action == 'force-stop' and item in running_vms.stdout
+          ignore_errors: yes
+
+        - name: Show status
+          debug:
+            msg: |
+              Running VMs:
+              {{ running_vms.stdout }}
+          when: action == 'status'

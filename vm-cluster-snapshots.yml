@@ -1,0 +1,246 @@
+
+---
+- name: Take snapshots of VM cluster
+  hosts: localhost
+  gather_facts: yes
+  vars:
+    vbox_host: "192.168.1.200"
+    vbox_user: "anandy"
+    snapshot_action: "{{ action | default('create') }}"
+    snapshot_name: "{{ snapshot | default('') }}"
+    vm_configs:
+      - { name: "ub-server-01", ip: "192.168.1.190", hostname: "master", role: "master" }
+      - { name: "ub-server-02", ip: "192.168.1.191", hostname: "worker1", role: "worker" }
+      - { name: "ub-server-03", ip: "192.168.1.192", hostname: "worker2", role: "worker" }
+      - { name: "ub-server-04", ip: "192.168.1.193", hostname: "worker3", role: "worker" }
+      - { name: "ub-server-05", ip: "192.168.1.194", hostname: "worker4", role: "worker" }
+
+  tasks:
+    - name: Get current timestamp
+      set_fact:
+        current_timestamp: "{{ ansible_date_time.iso8601 }}"
+        epoch_timestamp: "{{ ansible_date_time.epoch }}"
+
+    - name: Display snapshot operation details
+      debug:
+        msg: |
+          VM Snapshot Operation
+          ====================
+          Action: {{ snapshot_action | upper }}
+          Snapshot Name: {{ snapshot_name if snapshot_name else 'Auto-generated' }}
+          VirtualBox Host: {{ vbox_host }}
+          VMs to process: {{ vm_configs | length }}
+          Timestamp: {{ current_timestamp }}
+
+    - name: Validate parameters
+      fail:
+        msg: "Please specify snapshot name using -e snapshot=<name>"
+      when: snapshot_action in ['create', 'restore', 'delete'] and snapshot_name == ''
+
+    - name: Set auto-generated snapshot name if not provided
+      set_fact:
+        snapshot_name: "snapshot-{{ epoch_timestamp }}"
+      when: snapshot_action == 'create' and snapshot_name == ''
+
+    - name: Check VirtualBox host connectivity
+      delegate_to: "{{ vbox_host }}"
+      vars:
+        ansible_user: "{{ vbox_user }}"
+      ping:
+
+    - name: Get VM status before snapshot operation
+      delegate_to: "{{ vbox_host }}"
+      vars:
+        ansible_user: "{{ vbox_user }}"
+      command: VBoxManage list runningvms
+      register: running_vms
+
+    - name: Display VM status
+      debug:
+        msg: |
+          VM Status Before Snapshot:
+          {% for vm in vm_configs %}
+          - {{ vm.name }} ({{ vm.hostname }}): {{ 'RUNNING' if vm.name in running_vms.stdout else 'STOPPED' }}
+          {% endfor %}
+
+    - name: Create snapshots
+      delegate_to: "{{ vbox_host }}"
+      vars:
+        ansible_user: "{{ vbox_user }}"
+      block:
+        - name: Stop running VMs before snapshot
+          command: VBoxManage controlvm "{{ item.name }}" poweroff
+          loop: "{{ vm_configs }}"
+          when: item.name in running_vms.stdout
+          ignore_errors: yes
+          register: stop_results
+
+        - name: Wait for VMs to stop
+          pause:
+            seconds: 10
+
+        - name: Create snapshot for each VM
+          command: VBoxManage snapshot "{{ item.name }}" take "{{ snapshot_name }}" --description "Snapshot created on {{ current_timestamp }} - {{ item.role | upper }} node"
+          loop: "{{ vm_configs }}"
+          register: snapshot_results
+          ignore_errors: yes
+
+        - name: Display snapshot creation results
+          debug:
+            msg: |
+              Snapshot Creation Results:
+              {% for result in snapshot_results.results %}
+              {% set vm_name = vm_configs[loop.index0].name %}
+              - {{ vm_name }}: {{ 'SUCCESS' if result.rc == 0 else 'FAILED - ' + result.stderr }}
+              {% endfor %}
+
+        - name: Start VMs after snapshot
+          command: VBoxManage startvm "{{ item.name }}" --type headless
+          loop: "{{ vm_configs }}"
+          when: item.name in running_vms.stdout
+          ignore_errors: yes
+
+        - name: Wait for VMs to start
+          wait_for:
+            host: "{{ item.ip }}"
+            port: 22
+            delay: 30
+            timeout: 300
+          loop: "{{ vm_configs }}"
+          when: item.name in running_vms.stdout
+          ignore_errors: yes
+
+        - name: Create snapshot summary file
+          copy:
+            content: |
+              VM Cluster Snapshot Summary
+              ==========================
+              Snapshot Name: {{ snapshot_name }}
+              Created: {{ current_timestamp }}
+              Action: CREATE
+              
+              VM Details:
+              {% for vm in vm_configs %}
+              - {{ vm.name }} ({{ vm.hostname }})
+                IP: {{ vm.ip }}
+                Role: {{ vm.role }}
+                Status: {{ 'SUCCESS' if snapshot_results.results[loop.index0].rc == 0 else 'FAILED' }}
+              {% endfor %}
+            dest: "./snapshot-{{ snapshot_name }}-summary.txt"
+            mode: '0644'
+
+      when: snapshot_action == 'create'
+
+    - name: List snapshots
+      delegate_to: "{{ vbox_host }}"
+      vars:
+        ansible_user: "{{ vbox_user }}"
+      block:
+        - name: Get snapshots for each VM
+          command: VBoxManage snapshot "{{ item.name }}" list
+          loop: "{{ vm_configs }}"
+          register: snapshot_lists
+          ignore_errors: yes
+
+        - name: Display snapshot lists
+          debug:
+            msg: |
+              Snapshots for {{ item.item.name }}:
+              {{ item.stdout if item.rc == 0 else 'No snapshots or error: ' + item.stderr }}
+          loop: "{{ snapshot_lists.results }}"
+          loop_control:
+            label: "{{ item.item.name }}"
+
+      when: snapshot_action == 'list'
+
+    - name: Restore snapshots
+      delegate_to: "{{ vbox_host }}"
+      vars:
+        ansible_user: "{{ vbox_user }}"
+      block:
+        - name: Stop running VMs before restore
+          command: VBoxManage controlvm "{{ item.name }}" poweroff
+          loop: "{{ vm_configs }}"
+          when: item.name in running_vms.stdout
+          ignore_errors: yes
+
+        - name: Wait for VMs to stop
+          pause:
+            seconds: 10
+
+        - name: Restore snapshot for each VM
+          command: VBoxManage snapshot "{{ item.name }}" restore "{{ snapshot_name }}"
+          loop: "{{ vm_configs }}"
+          register: restore_results
+          ignore_errors: yes
+
+        - name: Display restore results
+          debug:
+            msg: |
+              Snapshot Restore Results:
+              {% for result in restore_results.results %}
+              {% set vm_name = vm_configs[loop.index0].name %}
+              - {{ vm_name }}: {{ 'SUCCESS' if result.rc == 0 else 'FAILED - ' + result.stderr }}
+              {% endfor %}
+
+        - name: Start VMs after restore
+          command: VBoxManage startvm "{{ item.name }}" --type headless
+          loop: "{{ vm_configs }}"
+          when: item.name in running_vms.stdout and restore_results.results[ansible_loop.index0].rc == 0
+          ignore_errors: yes
+          loop_control:
+            index_var: ansible_loop.index0
+
+        - name: Wait for VMs to start
+          wait_for:
+            host: "{{ item.ip }}"
+            port: 22
+            delay: 30
+            timeout: 300
+          loop: "{{ vm_configs }}"
+          when: item.name in running_vms.stdout and restore_results.results[ansible_loop.index0].rc == 0
+          ignore_errors: yes
+          loop_control:
+            index_var: ansible_loop.index0
+
+      when: snapshot_action == 'restore'
+
+    - name: Delete snapshots
+      delegate_to: "{{ vbox_host }}"
+      vars:
+        ansible_user: "{{ vbox_user }}"
+      block:
+        - name: Delete snapshot for each VM
+          command: VBoxManage snapshot "{{ item.name }}" delete "{{ snapshot_name }}"
+          loop: "{{ vm_configs }}"
+          register: delete_results
+          ignore_errors: yes
+
+        - name: Display delete results
+          debug:
+            msg: |
+              Snapshot Delete Results:
+              {% for result in delete_results.results %}
+              {% set vm_name = vm_configs[loop.index0].name %}
+              - {{ vm_name }}: {{ 'SUCCESS' if result.rc == 0 else 'FAILED - ' + result.stderr }}
+              {% endfor %}
+
+      when: snapshot_action == 'delete'
+
+    - name: Final status check
+      delegate_to: "{{ vbox_host }}"
+      vars:
+        ansible_user: "{{ vbox_user }}"
+      command: VBoxManage list runningvms
+      register: final_running_vms
+
+    - name: Display final status
+      debug:
+        msg: |
+          Final VM Status:
+          {% for vm in vm_configs %}
+          - {{ vm.name }} ({{ vm.hostname }}): {{ 'RUNNING' if vm.name in final_running_vms.stdout else 'STOPPED' }}
+          {% endfor %}
+          
+          Operation completed: {{ snapshot_action | upper }}
+          {{ 'Snapshot: ' + snapshot_name if snapshot_name else '' }}
