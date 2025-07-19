@@ -1,22 +1,28 @@
 
 ---
-- name: Install Docker and Kubernetes
+# ===== KUBERNETES SETUP USING SCRIPTS WITH SERIAL EXECUTION =====
+- name: Kubernetes Setup using Scripts - Serial Execution with Retry
   hosts: kubernetes
-  become: yes
-  strategy: linear
+  become: no
   gather_facts: yes
+  serial: 1  # Process one server at a time
   vars:
     kubernetes_version: "1.30.0-1.1"
     pod_network_cidr: "10.244.0.0/16"
     master_ip: "192.168.1.190"
-    
-    # Timeouts and retries
     kubeadm_timeout: 600
     apt_timeout: 300
     max_retries: 3
+    script_dir: "/home/ubuntu/k8s-scripts"
+    state_dir: "/var/lib/k8s-setup-state"
+    log_dir: "/home/ubuntu/k8s-setup-logs"
 
   tasks:
-    - name: Create local log directory
+    - name: "Display current server being processed"
+      debug:
+        msg: "Processing Kubernetes setup on {{ inventory_hostname }} ({{ ansible_host }}) - Role: {{ node_role }}"
+
+    - name: "Create local log directory"
       delegate_to: localhost
       become: no
       file:
@@ -25,101 +31,400 @@
         mode: '0755'
       run_once: true
 
-    - name: Create remote directories
+    - name: "Create script directory on remote host"
       file:
-        path: "{{ item.path }}"
+        path: "{{ script_dir }}"
         state: directory
-        mode: "{{ item.mode }}"
-        owner: "{{ item.owner }}"
-        group: "{{ item.group }}"
-      loop:
-        - { path: "/var/lib/k8s-setup-state", mode: "0755", owner: "ubuntu", group: "ubuntu" }
-        - { path: "/home/ubuntu/k8s-setup-logs", mode: "0755", owner: "ubuntu", group: "ubuntu" }
-        - { path: "/home/ubuntu/k8s-scripts", mode: "0755", owner: "ubuntu", group: "ubuntu" }
+        mode: '0755'
+        owner: ubuntu
+        group: ubuntu
 
-    - name: Copy setup scripts
+    - name: "Copy setup scripts to remote host"
       copy:
-        src: "{{ item }}"
-        dest: "/home/ubuntu/k8s-scripts/"
+        src: "scripts/{{ item }}"
+        dest: "{{ script_dir }}/{{ item }}"
         mode: '0755'
         owner: ubuntu
         group: ubuntu
       loop:
-        - "scripts/setup_k8s.sh"
-        - "scripts/utils.sh"
+        - setup_k8s.sh
+        - utils.sh
+        - run_step.sh
+        - cluster_status.sh
 
-    - name: Initialize setup log
-      shell: |
-        echo "================================================================" > /home/ubuntu/k8s-setup-logs/$(hostname)-setup.log
-        echo "Kubernetes Setup Log for $(hostname)" >> /home/ubuntu/k8s-setup-logs/$(hostname)-setup.log
-        echo "Started: $(date '+%Y-%m-%d %H:%M:%S')" >> /home/ubuntu/k8s-setup-logs/$(hostname)-setup.log
-        echo "Role: {{ node_role }}" >> /home/ubuntu/k8s-setup-logs/$(hostname)-setup.log
-        echo "IP: {{ ansible_host }}" >> /home/ubuntu/k8s-setup-logs/$(hostname)-setup.log
-        echo "================================================================" >> /home/ubuntu/k8s-setup-logs/$(hostname)-setup.log
-        chown ubuntu:ubuntu /home/ubuntu/k8s-setup-logs/$(hostname)-setup.log
-      changed_when: false
-
-    - name: Check if setup is already completed
-      stat:
-        path: "/var/lib/k8s-setup-state/setup_completed"
-      register: setup_completed
-
-    - name: Display skip message if already completed
-      debug:
-        msg: "Kubernetes setup already completed on {{ inventory_hostname }}"
-      when: setup_completed.stat.exists
-
-    - name: Run Kubernetes setup
-      shell: |
-        /home/ubuntu/k8s-scripts/setup_k8s.sh \
-          "{{ node_role }}" \
-          "/var/lib/k8s-setup-state" \
-          "/home/ubuntu/k8s-setup-logs" \
-          "{{ kubernetes_version }}" \
-          "{{ pod_network_cidr }}" \
-          "{{ master_ip }}" \
-          "{{ kubeadm_timeout }}" \
-          "{{ apt_timeout }}" \
-          "{{ max_retries }}" \
-          "{{ master_ip }}"
-      become_user: ubuntu
-      register: setup_result
-      when: not setup_completed.stat.exists
-      timeout: 1800
-
-    - name: Mark setup as completed
+    - name: "Create remote directories for state and logs"
+      become: yes
       file:
-        path: "/var/lib/k8s-setup-state/setup_completed"
-        state: touch
-        mode: '0644'
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
         owner: ubuntu
         group: ubuntu
-      when: setup_result is succeeded
+      loop:
+        - "{{ state_dir }}"
+        - "{{ log_dir }}"
 
-    - name: Display setup result
+    # ===== STEP 1: SYSTEM PREPARATION =====
+    - name: "STEP 1: Check if System Preparation already completed"
+      stat:
+        path: "{{ state_dir }}/01_system_prep_completed"
+      register: step1_status
+
+    - name: "STEP 1: Execute System Preparation"
+      command: "{{ script_dir }}/run_step.sh system_prep"
+      register: step1_result
+      retries: "{{ max_retries }}"
+      delay: 30
+      until: step1_result.rc == 0
+      when: not step1_status.stat.exists
+      timeout: 1200
+      environment:
+        HOME: "/home/ubuntu"
+        USER: "ubuntu"
+        LOG_FILE: "{{ log_dir }}/{{ inventory_hostname }}-setup.log"
+        STATE_DIR: "{{ state_dir }}"
+        MAX_RETRIES: "{{ max_retries }}"
+
+    - name: "STEP 1: Display results"
       debug:
-        var: setup_result.stdout_lines
-      when: setup_result is defined
+        msg: |
+          STEP 1 - System Preparation: {{ 'COMPLETED' if step1_status.stat.exists else ('SUCCESS' if step1_result is defined and step1_result.rc == 0 else 'FAILED') }}
+          {% if step1_result is defined and step1_result.stderr is defined and step1_result.stderr %}
+          Errors: {{ step1_result.stderr }}
+          {% endif %}
 
-    - name: Copy logs back to local
+    - name: "STEP 1: Fail if step failed after retries"
+      fail:
+        msg: "STEP 1 - System Preparation failed after {{ max_retries }} attempts"
+      when:
+        - not step1_status.stat.exists
+        - step1_result is defined
+        - step1_result.rc != 0
+
+    # ===== STEP 2: DOCKER INSTALLATION =====
+    - name: "STEP 2: Check if Docker Installation already completed"
+      stat:
+        path: "{{ state_dir }}/02_docker_install_completed"
+      register: step2_status
+
+    - name: "STEP 2: Execute Docker Installation"
+      command: "{{ script_dir }}/run_step.sh install_docker"
+      register: step2_result
+      retries: "{{ max_retries }}"
+      delay: 30
+      until: step2_result.rc == 0
+      when: not step2_status.stat.exists
+      timeout: 1800
+      environment:
+        HOME: "/home/ubuntu"
+        USER: "ubuntu"
+        LOG_FILE: "{{ log_dir }}/{{ inventory_hostname }}-setup.log"
+        STATE_DIR: "{{ state_dir }}"
+        MAX_RETRIES: "{{ max_retries }}"
+
+    - name: "STEP 2: Display results"
+      debug:
+        msg: |
+          STEP 2 - Docker Installation: {{ 'COMPLETED' if step2_status.stat.exists else ('SUCCESS' if step2_result is defined and step2_result.rc == 0 else 'FAILED') }}
+          {% if step2_result is defined and step2_result.stderr is defined and step2_result.stderr %}
+          Errors: {{ step2_result.stderr }}
+          {% endif %}
+
+    - name: "STEP 2: Fail if step failed after retries"
+      fail:
+        msg: "STEP 2 - Docker Installation failed after {{ max_retries }} attempts"
+      when:
+        - not step2_status.stat.exists
+        - step2_result is defined
+        - step2_result.rc != 0
+
+    # ===== STEP 3: KUBERNETES INSTALLATION =====
+    - name: "STEP 3: Check if Kubernetes Installation already completed"
+      stat:
+        path: "{{ state_dir }}/03_k8s_install_completed"
+      register: step3_status
+
+    - name: "STEP 3: Execute Kubernetes Installation"
+      command: "{{ script_dir }}/run_step.sh install_kubernetes"
+      register: step3_result
+      retries: "{{ max_retries }}"
+      delay: 30
+      until: step3_result.rc == 0
+      when: not step3_status.stat.exists
+      timeout: 1800
+      environment:
+        HOME: "/home/ubuntu"
+        USER: "ubuntu"
+        LOG_FILE: "{{ log_dir }}/{{ inventory_hostname }}-setup.log"
+        STATE_DIR: "{{ state_dir }}"
+        MAX_RETRIES: "{{ max_retries }}"
+        K8S_VERSION: "{{ kubernetes_version }}"
+
+    - name: "STEP 3: Display results"
+      debug:
+        msg: |
+          STEP 3 - Kubernetes Installation: {{ 'COMPLETED' if step3_status.stat.exists else ('SUCCESS' if step3_result is defined and step3_result.rc == 0 else 'FAILED') }}
+          {% if step3_result is defined and step3_result.stderr is defined and step3_result.stderr %}
+          Errors: {{ step3_result.stderr }}
+          {% endif %}
+
+    - name: "STEP 3: Fail if step failed after retries"
+      fail:
+        msg: "STEP 3 - Kubernetes Installation failed after {{ max_retries }} attempts"
+      when:
+        - not step3_status.stat.exists
+        - step3_result is defined
+        - step3_result.rc != 0
+
+    # ===== STEP 4: SYSTEM CONFIGURATION =====
+    - name: "STEP 4: Check if System Configuration already completed"
+      stat:
+        path: "{{ state_dir }}/04_system_config_completed"
+      register: step4_status
+
+    - name: "STEP 4: Execute System Configuration"
+      command: "{{ script_dir }}/run_step.sh configure_system"
+      register: step4_result
+      retries: "{{ max_retries }}"
+      delay: 15
+      until: step4_result.rc == 0
+      when: not step4_status.stat.exists
+      timeout: 600
+      environment:
+        HOME: "/home/ubuntu"
+        USER: "ubuntu"
+        LOG_FILE: "{{ log_dir }}/{{ inventory_hostname }}-setup.log"
+        STATE_DIR: "{{ state_dir }}"
+
+    - name: "STEP 4: Display results"
+      debug:
+        msg: |
+          STEP 4 - System Configuration: {{ 'COMPLETED' if step4_status.stat.exists else ('SUCCESS' if step4_result is defined and step4_result.rc == 0 else 'FAILED') }}
+          {% if step4_result is defined and step4_result.stderr is defined and step4_result.stderr %}
+          Errors: {{ step4_result.stderr }}
+          {% endif %}
+
+    - name: "STEP 4: Fail if step failed after retries"
+      fail:
+        msg: "STEP 4 - System Configuration failed after {{ max_retries }} attempts"
+      when:
+        - not step4_status.stat.exists
+        - step4_result is defined
+        - step4_result.rc != 0
+
+    # ===== STEP 5: ROLE-SPECIFIC SETUP =====
+    - name: "STEP 5: Check if Role-specific Setup already completed"
+      stat:
+        path: "{{ state_dir }}/05_{{ 'master_init' if node_role == 'master' else 'worker_join' }}_completed"
+      register: step5_status
+
+    - name: "STEP 5: Execute Master Initialization"
+      command: "{{ script_dir }}/run_step.sh initialize_master"
+      register: step5_master_result
+      retries: 2  # Reduced retries for master init
+      delay: 60
+      until: step5_master_result.rc == 0
+      when:
+        - not step5_status.stat.exists
+        - node_role == 'master'
+      timeout: "{{ kubeadm_timeout + 300 }}"
+      environment:
+        HOME: "/home/ubuntu"
+        USER: "ubuntu"
+        LOG_FILE: "{{ log_dir }}/{{ inventory_hostname }}-setup.log"
+        STATE_DIR: "{{ state_dir }}"
+        POD_CIDR: "{{ pod_network_cidr }}"
+        MASTER_IP: "{{ master_ip }}"
+        KUBEADM_TIMEOUT: "{{ kubeadm_timeout }}"
+        NODE_ROLE: "{{ node_role }}"
+
+    - name: "STEP 5: Execute Worker Join"
+      command: "{{ script_dir }}/run_step.sh join_worker"
+      register: step5_worker_result
+      retries: "{{ max_retries }}"
+      delay: 30
+      until: step5_worker_result.rc == 0
+      when:
+        - not step5_status.stat.exists
+        - node_role == 'worker'
+      timeout: 900
+      environment:
+        HOME: "/home/ubuntu"
+        USER: "ubuntu"
+        LOG_FILE: "{{ log_dir }}/{{ inventory_hostname }}-setup.log"
+        STATE_DIR: "{{ state_dir }}"
+        MASTER_HOST: "{{ master_ip }}"
+        NODE_ROLE: "{{ node_role }}"
+
+    - name: "STEP 5: Display results"
+      debug:
+        msg: |
+          STEP 5 - {{ 'Master Initialization' if node_role == 'master' else 'Worker Join' }}: {{ 'COMPLETED' if step5_status.stat.exists else ('SUCCESS' if ((step5_master_result is defined and step5_master_result.rc == 0) if node_role == 'master' else (step5_worker_result is defined and step5_worker_result.rc == 0)) else 'FAILED') }}
+          {% set result = step5_master_result if node_role == 'master' else step5_worker_result %}
+          {% if result is defined and result.stderr is defined and result.stderr %}
+          Errors: {{ result.stderr }}
+          {% endif %}
+
+    - name: "STEP 5: Fail if step failed after retries"
+      fail:
+        msg: "STEP 5 - Master Initialization failed after retries"
+      when:
+        - not step5_status.stat.exists
+        - node_role == 'master'
+        - step5_master_result is defined
+        - step5_master_result.failed | default(false)
+
+    - name: "STEP 5: Fail if worker join failed after retries"
+      fail:
+        msg: "STEP 5 - Worker Join failed after retries"
+      when:
+        - not step5_status.stat.exists
+        - node_role == 'worker'
+        - step5_worker_result is defined
+        - step5_worker_result.failed | default(false)
+
+    # ===== STEP 6: CNI INSTALLATION (Master Only) =====
+    - name: "STEP 6: Check if CNI Installation already completed"
+      stat:
+        path: "{{ state_dir }}/06_cni_install_completed"
+      register: step6_status
+      when: node_role == 'master'
+
+    - name: "STEP 6: Execute CNI Installation"
+      command: "{{ script_dir }}/run_step.sh install_cni"
+      register: step6_result
+      retries: "{{ max_retries }}"
+      delay: 30
+      until: step6_result.rc == 0
+      when:
+        - node_role == 'master'
+        - not step6_status.stat.exists
+      timeout: 600
+      environment:
+        HOME: "/home/ubuntu"
+        USER: "ubuntu"
+        LOG_FILE: "{{ log_dir }}/{{ inventory_hostname }}-setup.log"
+        STATE_DIR: "{{ state_dir }}"
+        KUBECONFIG: "/home/ubuntu/.kube/config"
+
+    - name: "STEP 6: Display results"
+      debug:
+        msg: |
+          STEP 6 - CNI Installation: {{ 'COMPLETED' if step6_status.stat.exists else ('SUCCESS' if step6_result is defined and step6_result.rc == 0 else 'FAILED') }}
+          {% if step6_result is defined and step6_result.stderr is defined and step6_result.stderr %}
+          Errors: {{ step6_result.stderr }}
+          {% endif %}
+      when: node_role == 'master'
+
+    - name: "STEP 6: Fail if step failed after retries"
+      fail:
+        msg: "STEP 6 - CNI Installation failed after {{ max_retries }} attempts"
+      when:
+        - node_role == 'master'
+        - not step6_status.stat.exists
+        - step6_result is defined
+        - step6_result.rc != 0
+
+    # ===== FINAL VERIFICATION =====
+    - name: "FINAL: Execute Verification"
+      command: "{{ script_dir }}/run_step.sh verify_installation"
+      register: verification_result
+      timeout: 300
+      environment:
+        HOME: "/home/ubuntu"
+        USER: "ubuntu"
+        LOG_FILE: "{{ log_dir }}/{{ inventory_hostname }}-setup.log"
+        STATE_DIR: "{{ state_dir }}"
+
+    - name: "FINAL: Display verification results"
+      debug:
+        msg: |
+          FINAL VERIFICATION: {{ 'SUCCESS' if verification_result is defined and verification_result.rc == 0 else 'FAILED' }}
+          {% if verification_result is defined and verification_result.stdout_lines is defined %}
+          Output:
+          {{ verification_result.stdout_lines[-10:] if verification_result.stdout_lines | length > 10 else verification_result.stdout_lines }}
+          {% endif %}
+
+    - name: "Copy logs back to local"
       fetch:
-        src: "/home/ubuntu/k8s-setup-logs/{{ inventory_hostname }}-setup.log"
-        dest: "./logs/"
+        src: "{{ log_dir }}/{{ inventory_hostname }}-setup.log"
+        dest: "./logs/{{ inventory_hostname }}-setup.log"
         flat: yes
       ignore_errors: yes
 
-  post_tasks:
-    - name: Verify cluster status (master only)
-      shell: |
-        export KUBECONFIG=/home/ubuntu/.kube/config
-        kubectl get nodes -o wide
-        kubectl get pods -A
-      become_user: ubuntu
-      register: cluster_status
-      when: node_role == 'master'
-      ignore_errors: yes
-
-    - name: Display cluster status
+    - name: "Display overall completion status"
       debug:
-        var: cluster_status.stdout_lines
-      when: node_role == 'master' and cluster_status is defined
+        msg: |
+          ===============================================
+          KUBERNETES SETUP COMPLETED ON {{ inventory_hostname.upper() }}
+          ===============================================
+          Role: {{ node_role }}
+          IP: {{ ansible_host }}
+          
+          Steps Completed:
+          ✓ STEP 1: System Preparation
+          ✓ STEP 2: Docker Installation  
+          ✓ STEP 3: Kubernetes Installation
+          ✓ STEP 4: System Configuration
+          ✓ STEP 5: {{ 'Master Initialization' if node_role == 'master' else 'Worker Join' }}
+          {{ '✓ STEP 6: CNI Installation' if node_role == 'master' else '' }}
+          ✓ FINAL: Verification
+          
+          Setup completed successfully!
+          ===============================================
+
+# ===== CLUSTER-WIDE FINAL VERIFICATION =====
+- name: Cluster-wide Final Verification
+  hosts: master
+  become: no
+  gather_facts: no
+
+  tasks:
+    - name: "Wait for cluster to stabilize"
+      pause:
+        seconds: 60
+        prompt: "Waiting for cluster to stabilize before final verification..."
+
+    - name: "Final cluster verification"
+      command: "{{ script_dir }}/cluster_status.sh"
+      register: final_cluster_status
+      ignore_errors: yes
+      environment:
+        HOME: "/home/ubuntu"
+        USER: "ubuntu"
+        KUBECONFIG: "/home/ubuntu/.kube/config"
+
+    - name: "Display final cluster status"
+      debug:
+        msg: "{{ final_cluster_status.stdout_lines }}"
+      when: final_cluster_status.stdout_lines is defined
+
+    - name: "Save final cluster status"
+      delegate_to: localhost
+      copy:
+        content: |
+          Kubernetes Cluster Final Status Report
+          =====================================
+          Generated: {{ ansible_date_time.iso8601 }}
+          Master Node: {{ inventory_hostname }} ({{ ansible_host }})
+          
+          {{ final_cluster_status.stdout if final_cluster_status.stdout is defined else 'No cluster status available' }}
+        dest: "./logs/final-cluster-status.txt"
+        mode: '0644'
+
+    - name: "Display final success message"
+      debug:
+        msg: |
+          ===============================================
+          🎉 KUBERNETES CLUSTER SETUP COMPLETED! 🎉
+          ===============================================
+          
+          Your cluster is ready!
+          
+          To access your cluster:
+          ssh ubuntu@{{ ansible_host }}
+          kubectl get nodes
+          kubectl get pods -A
+          
+          All logs saved to ./logs/ directory
+          ===============================================
