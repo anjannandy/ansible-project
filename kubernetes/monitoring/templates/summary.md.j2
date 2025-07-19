@@ -1,0 +1,22 @@
+# Complete Kubernetes Monitoring Setup! 🎉
+
+**Setup Date:** {{ ansible_date_time.iso8601 }}
+
+## ✅ What Was Deployed
+
+### 1. Node Exporter (Port 9100) - System Metrics
+{% for host in groups['kubernetes'] %}
+- **{{ host }}** ({{ hostvars[host]['node_role'] }}): http://{{ hostvars[host]['ansible_host'] }}:9100/metrics
+{% endfor %}
+
+### 2. kube-state-metrics (Port 30080) - Kubernetes Object Metrics
+- **Cluster Metrics**: http://{{ hostvars['master']['ansible_host'] }}:30080/metrics
+
+### 3. cAdvisor (Port 8080) - Container/Pod Metrics
+{% for host in groups['kubernetes'] %}
+- **{{ host }}** ({{ hostvars[host]['node_role'] }}): http://{{ hostvars[host]['ansible_host'] }}:8080/metrics
+{% endfor %}
+
+## 🔧 Next Step: Update Prometheus
+
+### SSH to Prometheus Server and Run Update Script
