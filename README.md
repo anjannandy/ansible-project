@@ -22,3 +22,11 @@ ansible-playbook vm-cluster-snapshots.yml -e action=restore -e snapshot=before-k
 315    # Kubernetes cluster monitoring
 7249   # Kubernetes Cluster
 1860   # Node Exporter Full
+
+
+**Dashboard IDs:**
+- `10000` - Kubernetes / API server
+- `10001` - Kubernetes / Cluster
+- `10002` - Kubernetes / Node
+- `10003` - Kubernetes / Pod
+
