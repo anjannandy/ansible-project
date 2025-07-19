@@ -1,0 +1,61 @@
+# Complete Kubernetes Monitoring Configuration for Prometheus
+# Add these jobs to your existing prometheus.yml scrape_configs section
+
+  # Node Exporter - System metrics from all Kubernetes nodes
+  - job_name: 'kubernetes-nodes'
+    static_configs:
+      - targets: ['192.168.1.190:9100']
+        labels:
+          node: 'master'
+          role: 'master'
+      - targets: ['192.168.1.191:9100']
+        labels:
+          node: 'worker1'
+          role: 'worker'
+      - targets: ['192.168.1.192:9100']
+        labels:
+          node: 'worker2'
+          role: 'worker'
+      - targets: ['192.168.1.193:9100']
+        labels:
+          node: 'worker3'
+          role: 'worker'
+      - targets: ['192.168.1.194:9100']
+        labels:
+          node: 'worker4'
+          role: 'worker'
+    scrape_interval: 15s
+
+  # kube-state-metrics - Kubernetes object metrics
+  - job_name: 'kube-state-metrics'
+    static_configs:
+      - targets: ['192.168.1.190:30080']
+        labels:
+          cluster: 'kubernetes'
+    scrape_interval: 15s
+
+  # cAdvisor - Container/Pod metrics (standalone DaemonSet)
+  - job_name: 'cadvisor'
+    static_configs:
+      - targets: ['192.168.1.190:8080']
+        labels:
+          node: 'master'
+          role: 'master'
+      - targets: ['192.168.1.191:8080']
+        labels:
+          node: 'worker1'
+          role: 'worker'
+      - targets: ['192.168.1.192:8080']
+        labels:
+          node: 'worker2'
+          role: 'worker'
+      - targets: ['192.168.1.193:8080']
+        labels:
+          node: 'worker3'
+          role: 'worker'
+      - targets: ['192.168.1.194:8080']
+        labels:
+          node: 'worker4'
+          role: 'worker'
+    scrape_interval: 15s
+    metrics_path: /metrics
