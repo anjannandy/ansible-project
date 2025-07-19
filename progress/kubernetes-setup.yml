@@ -1,0 +1,125 @@
+
+---
+- name: Install Docker and Kubernetes
+  hosts: kubernetes
+  become: yes
+  strategy: linear
+  gather_facts: yes
+  vars:
+    kubernetes_version: "1.30.0-1.1"
+    pod_network_cidr: "10.244.0.0/16"
+    master_ip: "192.168.1.190"
+    
+    # Timeouts and retries
+    kubeadm_timeout: 600
+    apt_timeout: 300
+    max_retries: 3
+
+  tasks:
+    - name: Create local log directory
+      delegate_to: localhost
+      become: no
+      file:
+        path: "./logs"
+        state: directory
+        mode: '0755'
+      run_once: true
+
+    - name: Create remote directories
+      file:
+        path: "{{ item.path }}"
+        state: directory
+        mode: "{{ item.mode }}"
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+      loop:
+        - { path: "/var/lib/k8s-setup-state", mode: "0755", owner: "ubuntu", group: "ubuntu" }
+        - { path: "/home/ubuntu/k8s-setup-logs", mode: "0755", owner: "ubuntu", group: "ubuntu" }
+        - { path: "/home/ubuntu/k8s-scripts", mode: "0755", owner: "ubuntu", group: "ubuntu" }
+
+    - name: Copy setup scripts
+      copy:
+        src: "{{ item }}"
+        dest: "/home/ubuntu/k8s-scripts/"
+        mode: '0755'
+        owner: ubuntu
+        group: ubuntu
+      loop:
+        - "scripts/setup_k8s.sh"
+        - "scripts/utils.sh"
+
+    - name: Initialize setup log
+      shell: |
+        echo "================================================================" > /home/ubuntu/k8s-setup-logs/$(hostname)-setup.log
+        echo "Kubernetes Setup Log for $(hostname)" >> /home/ubuntu/k8s-setup-logs/$(hostname)-setup.log
+        echo "Started: $(date '+%Y-%m-%d %H:%M:%S')" >> /home/ubuntu/k8s-setup-logs/$(hostname)-setup.log
+        echo "Role: {{ node_role }}" >> /home/ubuntu/k8s-setup-logs/$(hostname)-setup.log
+        echo "IP: {{ ansible_host }}" >> /home/ubuntu/k8s-setup-logs/$(hostname)-setup.log
+        echo "================================================================" >> /home/ubuntu/k8s-setup-logs/$(hostname)-setup.log
+        chown ubuntu:ubuntu /home/ubuntu/k8s-setup-logs/$(hostname)-setup.log
+      changed_when: false
+
+    - name: Check if setup is already completed
+      stat:
+        path: "/var/lib/k8s-setup-state/setup_completed"
+      register: setup_completed
+
+    - name: Display skip message if already completed
+      debug:
+        msg: "Kubernetes setup already completed on {{ inventory_hostname }}"
+      when: setup_completed.stat.exists
+
+    - name: Run Kubernetes setup
+      shell: |
+        /home/ubuntu/k8s-scripts/setup_k8s.sh \
+          "{{ node_role }}" \
+          "/var/lib/k8s-setup-state" \
+          "/home/ubuntu/k8s-setup-logs" \
+          "{{ kubernetes_version }}" \
+          "{{ pod_network_cidr }}" \
+          "{{ master_ip }}" \
+          "{{ kubeadm_timeout }}" \
+          "{{ apt_timeout }}" \
+          "{{ max_retries }}" \
+          "{{ master_ip }}"
+      become_user: ubuntu
+      register: setup_result
+      when: not setup_completed.stat.exists
+      timeout: 1800
+
+    - name: Mark setup as completed
+      file:
+        path: "/var/lib/k8s-setup-state/setup_completed"
+        state: touch
+        mode: '0644'
+        owner: ubuntu
+        group: ubuntu
+      when: setup_result is succeeded
+
+    - name: Display setup result
+      debug:
+        var: setup_result.stdout_lines
+      when: setup_result is defined
+
+    - name: Copy logs back to local
+      fetch:
+        src: "/home/ubuntu/k8s-setup-logs/{{ inventory_hostname }}-setup.log"
+        dest: "./logs/"
+        flat: yes
+      ignore_errors: yes
+
+  post_tasks:
+    - name: Verify cluster status (master only)
+      shell: |
+        export KUBECONFIG=/home/ubuntu/.kube/config
+        kubectl get nodes -o wide
+        kubectl get pods -A
+      become_user: ubuntu
+      register: cluster_status
+      when: node_role == 'master'
+      ignore_errors: yes
+
+    - name: Display cluster status
+      debug:
+        var: cluster_status.stdout_lines
+      when: node_role == 'master' and cluster_status is defined
