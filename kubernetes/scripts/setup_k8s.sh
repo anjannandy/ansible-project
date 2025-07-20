@@ -250,6 +250,7 @@ EOF
     log_info "Disabling swap..."
     sudo swapoff -a
     sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+    sudo sed -i '/\/swap\.img/s/^/#/' /etc/fstab
 
     log_success "System configuration completed"
 }

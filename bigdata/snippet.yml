@@ -1,0 +1,539 @@
+---
+# ===== COMPREHENSIVE HADOOP ECOSYSTEM SETUP =====
+- name: Complete Hadoop Ecosystem Setup using Scripts - Serial Execution with Retry
+  hosts: hadoop
+  become: no
+  gather_facts: yes
+  serial: 1  # Process one server at a time
+  vars:
+    # Core versions
+    hadoop_version: "3.3.6"
+    java_version: "11"
+    
+    # Processing engines
+    spark_version: "3.5.0"
+    flink_version: "1.18.0"
+    
+    # Data warehousing & SQL
+    hive_version: "3.1.3"
+    presto_version: "0.281"
+    drill_version: "1.21.1"
+    
+    # NoSQL databases
+    hbase_version: "2.5.5"
+    cassandra_version: "4.1.3"
+    mongodb_version: "7.0"
+    
+    # Streaming & messaging
+    kafka_version: "2.13-3.5.1"
+    nifi_version: "1.23.2"
+    storm_version: "2.5.0"
+    
+    # Coordination & management
+    zookeeper_version: "3.8.2"
+    ambari_version: "2.7.5"
+    
+    # Data ingestion & ETL
+    sqoop_version: "1.4.7"
+    flume_version: "1.11.0"
+    
+    # Machine Learning
+    mahout_version: "14.1"
+    
+    # Search & indexing
+    solr_version: "9.4.0"
+    elasticsearch_version: "8.11.0"
+    
+    # Workflow management
+    oozie_version: "5.2.1"
+    airflow_version: "2.7.3"
+    
+    # Monitoring & metrics
+    ganglia_version: "3.7.2"
+    
+    # Installation paths
+    hadoop_home: "/opt/hadoop"
+    spark_home: "/opt/spark"
+    flink_home: "/opt/flink"
+    hive_home: "/opt/hive"
+    presto_home: "/opt/presto"
+    drill_home: "/opt/drill"
+    hbase_home: "/opt/hbase"
+    cassandra_home: "/opt/cassandra"
+    kafka_home: "/opt/kafka"
+    nifi_home: "/opt/nifi"
+    storm_home: "/opt/storm"
+    zookeeper_home: "/opt/zookeeper"
+    sqoop_home: "/opt/sqoop"
+    flume_home: "/opt/flume"
+    mahout_home: "/opt/mahout"
+    solr_home: "/opt/solr"
+    elasticsearch_home: "/opt/elasticsearch"
+    oozie_home: "/opt/oozie"
+    
+    # Configuration
+    max_retries: 3
+    script_dir: "/home/ubuntu/hadoop-scripts"
+    state_dir: "/var/lib/hadoop-setup-state"
+    log_dir: "/home/ubuntu/hadoop-setup-logs"
+    namenode_host: "{{ groups['namenode'][0] }}"
+    resourcemanager_host: "{{ groups['resourcemanager'][0] if groups['resourcemanager'] is defined else groups['namenode'][0] }}"
+    hbase_master_host: "{{ groups['hbase_master'][0] if groups['hbase_master'] is defined else groups['namenode'][0] }}"
+
+  tasks:
+    - name: "Display current server being processed"
+      debug:
+        msg: "Processing Hadoop Ecosystem setup on {{ inventory_hostname }} ({{ ansible_host }}) - Role: {{ node_role }}"
+
+    - name: "Create local log directory"
+      delegate_to: localhost
+      become: no
+      file:
+        path: "./logs"
+        state: directory
+        mode: '0755'
+      run_once: true
+
+    - name: "Create script directory on remote host"
+      file:
+        path: "{{ script_dir }}"
+        state: directory
+        mode: '0755'
+        owner: ubuntu
+        group: ubuntu
+
+    - name: "Copy setup scripts to remote host"
+      copy:
+        src: "scripts/{{ item }}"
+        dest: "{{ script_dir }}/{{ item }}"
+        mode: '0755'
+        owner: ubuntu
+        group: ubuntu
+      loop:
+        - setup_hadoop_ecosystem.sh
+        - ecosystem_utils.sh
+        - run_ecosystem_step.sh
+        - cluster_health_full.sh
+        - install_core.sh
+        - install_processing.sh
+        - install_databases.sh
+        - install_streaming.sh
+        - install_tools.sh
+
+    - name: "Create remote directories for state and logs"
+      become: yes
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+        owner: ubuntu
+        group: ubuntu
+      loop:
+        - "{{ state_dir }}"
+        - "{{ log_dir }}"
+
+    # ===== STEP 1: JAVA & SYSTEM PREPARATION =====
+    - name: "STEP 1: Check if Java & System Preparation already completed"
+      stat:
+        path: "{{ state_dir }}/01_java_system_completed"
+      register: step1_status
+
+    - name: "STEP 1: Execute Java & System Preparation"
+      command: "{{ script_dir }}/run_ecosystem_step.sh prepare_system"
+      register: step1_result
+      retries: "{{ max_retries }}"
+      delay: 30
+      until: step1_result.rc == 0
+      when: not step1_status.stat.exists
+      timeout: 1800
+      environment:
+        HOME: "/home/ubuntu"
+        USER: "ubuntu"
+        LOG_FILE: "{{ log_dir }}/{{ inventory_hostname }}-setup.log"
+        STATE_DIR: "{{ state_dir }}"
+        MAX_RETRIES: "{{ max_retries }}"
+        JAVA_VERSION: "{{ java_version }}"
+
+    - name: "STEP 1: Display results"
+      debug:
+        msg: |
+          STEP 1 - Java & System Preparation: {{ 'COMPLETED' if step1_status.stat.exists else ('SUCCESS' if step1_result is defined and step1_result.rc == 0 else 'FAILED') }}
+
+    # ===== STEP 2: CORE HADOOP ECOSYSTEM =====
+    - name: "STEP 2: Check if Core Hadoop Ecosystem already completed"
+      stat:
+        path: "{{ state_dir }}/02_core_hadoop_completed"
+      register: step2_status
+
+    - name: "STEP 2: Execute Core Hadoop Ecosystem Installation"
+      command: "{{ script_dir }}/run_ecosystem_step.sh install_core_hadoop"
+      register: step2_result
+      retries: "{{ max_retries }}"
+      delay: 30
+      until: step2_result.rc == 0
+      when: not step2_status.stat.exists
+      timeout: 2400
+      environment:
+        HOME: "/home/ubuntu"
+        USER: "ubuntu"
+        LOG_FILE: "{{ log_dir }}/{{ inventory_hostname }}-setup.log"
+        STATE_DIR: "{{ state_dir }}"
+        MAX_RETRIES: "{{ max_retries }}"
+        HADOOP_VERSION: "{{ hadoop_version }}"
+        HIVE_VERSION: "{{ hive_version }}"
+        SQOOP_VERSION: "{{ sqoop_version }}"
+        FLUME_VERSION: "{{ flume_version }}"
+        OOZIE_VERSION: "{{ oozie_version }}"
+        HADOOP_HOME: "{{ hadoop_home }}"
+        HIVE_HOME: "{{ hive_home }}"
+        SQOOP_HOME: "{{ sqoop_home }}"
+        FLUME_HOME: "{{ flume_home }}"
+        OOZIE_HOME: "{{ oozie_home }}"
+
+    - name: "STEP 2: Display results"
+      debug:
+        msg: |
+          STEP 2 - Core Hadoop Ecosystem: {{ 'COMPLETED' if step2_status.stat.exists else ('SUCCESS' if step2_result is defined and step2_result.rc == 0 else 'FAILED') }}
+
+    # ===== STEP 3: PROCESSING ENGINES =====
+    - name: "STEP 3: Check if Processing Engines already completed"
+      stat:
+        path: "{{ state_dir }}/03_processing_engines_completed"
+      register: step3_status
+
+    - name: "STEP 3: Execute Processing Engines Installation"
+      command: "{{ script_dir }}/run_ecosystem_step.sh install_processing_engines"
+      register: step3_result
+      retries: "{{ max_retries }}"
+      delay: 30
+      until: step3_result.rc == 0
+      when: not step3_status.stat.exists
+      timeout: 2400
+      environment:
+        HOME: "/home/ubuntu"
+        USER: "ubuntu"
+        LOG_FILE: "{{ log_dir }}/{{ inventory_hostname }}-setup.log"
+        STATE_DIR: "{{ state_dir }}"
+        MAX_RETRIES: "{{ max_retries }}"
+        SPARK_VERSION: "{{ spark_version }}"
+        FLINK_VERSION: "{{ flink_version }}"
+        PRESTO_VERSION: "{{ presto_version }}"
+        DRILL_VERSION: "{{ drill_version }}"
+        MAHOUT_VERSION: "{{ mahout_version }}"
+        SPARK_HOME: "{{ spark_home }}"
+        FLINK_HOME: "{{ flink_home }}"
+        PRESTO_HOME: "{{ presto_home }}"
+        DRILL_HOME: "{{ drill_home }}"
+        MAHOUT_HOME: "{{ mahout_home }}"
+
+    - name: "STEP 3: Display results"
+      debug:
+        msg: |
+          STEP 3 - Processing Engines: {{ 'COMPLETED' if step3_status.stat.exists else ('SUCCESS' if step3_result is defined and step3_result.rc == 0 else 'FAILED') }}
+
+    # ===== STEP 4: NOSQL DATABASES =====
+    - name: "STEP 4: Check if NoSQL Databases already completed"
+      stat:
+        path: "{{ state_dir }}/04_nosql_databases_completed"
+      register: step4_status
+
+    - name: "STEP 4: Execute NoSQL Databases Installation"
+      command: "{{ script_dir }}/run_ecosystem_step.sh install_nosql_databases"
+      register: step4_result
+      retries: "{{ max_retries }}"
+      delay: 30
+      until: step4_result.rc == 0
+      when: not step4_status.stat.exists
+      timeout: 2400
+      environment:
+        HOME: "/home/ubuntu"
+        USER: "ubuntu"
+        LOG_FILE: "{{ log_dir }}/{{ inventory_hostname }}-setup.log"
+        STATE_DIR: "{{ state_dir }}"
+        MAX_RETRIES: "{{ max_retries }}"
+        HBASE_VERSION: "{{ hbase_version }}"
+        CASSANDRA_VERSION: "{{ cassandra_version }}"
+        MONGODB_VERSION: "{{ mongodb_version }}"
+        HBASE_HOME: "{{ hbase_home }}"
+        CASSANDRA_HOME: "{{ cassandra_home }}"
+
+    - name: "STEP 4: Display results"
+      debug:
+        msg: |
+          STEP 4 - NoSQL Databases: {{ 'COMPLETED' if step4_status.stat.exists else ('SUCCESS' if step4_result is defined and step4_result.rc == 0 else 'FAILED') }}
+
+    # ===== STEP 5: STREAMING & MESSAGING =====
+    - name: "STEP 5: Check if Streaming & Messaging already completed"
+      stat:
+        path: "{{ state_dir }}/05_streaming_messaging_completed"
+      register: step5_status
+
+    - name: "STEP 5: Execute Streaming & Messaging Installation"
+      command: "{{ script_dir }}/run_ecosystem_step.sh install_streaming_messaging"
+      register: step5_result
+      retries: "{{ max_retries }}"
+      delay: 30
+      until: step5_result.rc == 0
+      when: not step5_status.stat.exists
+      timeout: 2400
+      environment:
+        HOME: "/home/ubuntu"
+        USER: "ubuntu"
+        LOG_FILE: "{{ log_dir }}/{{ inventory_hostname }}-setup.log"
+        STATE_DIR: "{{ state_dir }}"
+        MAX_RETRIES: "{{ max_retries }}"
+        KAFKA_VERSION: "{{ kafka_version }}"
+        NIFI_VERSION: "{{ nifi_version }}"
+        STORM_VERSION: "{{ storm_version }}"
+        ZOOKEEPER_VERSION: "{{ zookeeper_version }}"
+        KAFKA_HOME: "{{ kafka_home }}"
+        NIFI_HOME: "{{ nifi_home }}"
+        STORM_HOME: "{{ storm_home }}"
+        ZOOKEEPER_HOME: "{{ zookeeper_home }}"
+
+    - name: "STEP 5: Display results"
+      debug:
+        msg: |
+          STEP 5 - Streaming & Messaging: {{ 'COMPLETED' if step5_status.stat.exists else ('SUCCESS' if step5_result is defined and step5_result.rc == 0 else 'FAILED') }}
+
+    # ===== STEP 6: SEARCH & INDEXING =====
+    - name: "STEP 6: Check if Search & Indexing already completed"
+      stat:
+        path: "{{ state_dir }}/06_search_indexing_completed"
+      register: step6_status
+
+    - name: "STEP 6: Execute Search & Indexing Installation"
+      command: "{{ script_dir }}/run_ecosystem_step.sh install_search_indexing"
+      register: step6_result
+      retries: "{{ max_retries }}"
+      delay: 30
+      until: step6_result.rc == 0
+      when: not step6_status.stat.exists
+      timeout: 1800
+      environment:
+        HOME: "/home/ubuntu"
+        USER: "ubuntu"
+        LOG_FILE: "{{ log_dir }}/{{ inventory_hostname }}-setup.log"
+        STATE_DIR: "{{ state_dir }}"
+        MAX_RETRIES: "{{ max_retries }}"
+        SOLR_VERSION: "{{ solr_version }}"
+        ELASTICSEARCH_VERSION: "{{ elasticsearch_version }}"
+        SOLR_HOME: "{{ solr_home }}"
+        ELASTICSEARCH_HOME: "{{ elasticsearch_home }}"
+
+    - name: "STEP 6: Display results"
+      debug:
+        msg: |
+          STEP 6 - Search & Indexing: {{ 'COMPLETED' if step6_status.stat.exists else ('SUCCESS' if step6_result is defined and step6_result.rc == 0 else 'FAILED') }}
+
+    # ===== STEP 7: WORKFLOW & ORCHESTRATION =====
+    - name: "STEP 7: Check if Workflow & Orchestration already completed"
+      stat:
+        path: "{{ state_dir }}/07_workflow_orchestration_completed"
+      register: step7_status
+      when: node_role in ['namenode', 'master']
+
+    - name: "STEP 7: Execute Workflow & Orchestration Installation"
+      command: "{{ script_dir }}/run_ecosystem_step.sh install_workflow_orchestration"
+      register: step7_result
+      retries: "{{ max_retries }}"
+      delay: 30
+      until: step7_result.rc == 0
+      when: 
+        - node_role in ['namenode', 'master']
+        - not step7_status.stat.exists
+      timeout: 1800
+      environment:
+        HOME: "/home/ubuntu"
+        USER: "ubuntu"
+        LOG_FILE: "{{ log_dir }}/{{ inventory_hostname }}-setup.log"
+        STATE_DIR: "{{ state_dir }}"
+        MAX_RETRIES: "{{ max_retries }}"
+        AIRFLOW_VERSION: "{{ airflow_version }}"
+
+    - name: "STEP 7: Display results"
+      debug:
+        msg: |
+          STEP 7 - Workflow & Orchestration: {{ 'COMPLETED' if step7_status.stat.exists else ('SUCCESS' if step7_result is defined and step7_result.rc == 0 else 'SKIPPED') }}
+      when: node_role in ['namenode', 'master']
+
+    # ===== STEP 8: CONFIGURATION =====
+    - name: "STEP 8: Check if Configuration already completed"
+      stat:
+        path: "{{ state_dir }}/08_configuration_completed"
+      register: step8_status
+
+    - name: "STEP 8: Execute Configuration"
+      command: "{{ script_dir }}/run_ecosystem_step.sh configure_ecosystem"
+      register: step8_result
+      retries: "{{ max_retries }}"
+      delay: 30
+      until: step8_result.rc == 0
+      when: not step8_status.stat.exists
+      timeout: 1200
+      environment:
+        HOME: "/home/ubuntu"
+        USER: "ubuntu"
+        LOG_FILE: "{{ log_dir }}/{{ inventory_hostname }}-setup.log"
+        STATE_DIR: "{{ state_dir }}"
+        MAX_RETRIES: "{{ max_retries }}"
+        NODE_ROLE: "{{ node_role }}"
+        NAMENODE_HOST: "{{ hostvars[namenode_host]['ansible_host'] }}"
+        RESOURCEMANAGER_HOST: "{{ hostvars[resourcemanager_host]['ansible_host'] }}"
+        HBASE_MASTER_HOST: "{{ hostvars[hbase_master_host]['ansible_host'] }}"
+
+    - name: "STEP 8: Display results"
+      debug:
+        msg: |
+          STEP 8 - Configuration: {{ 'COMPLETED' if step8_status.stat.exists else ('SUCCESS' if step8_result is defined and step8_result.rc == 0 else 'FAILED') }}
+
+    # ===== STEP 9: ROLE-SPECIFIC INITIALIZATION =====
+    - name: "STEP 9: Check if Role-specific Initialization already completed"
+      stat:
+        path: "{{ state_dir }}/09_role_init_completed"
+      register: step9_status
+
+    - name: "STEP 9: Execute Role-specific Initialization"
+      command: "{{ script_dir }}/run_ecosystem_step.sh initialize_role"
+      register: step9_result
+      retries: "{{ max_retries }}"
+      delay: 30
+      until: step9_result.rc == 0
+      when: not step9_status.stat.exists
+      timeout: 1200
+      environment:
+        HOME: "/home/ubuntu"
+        USER: "ubuntu"
+        LOG_FILE: "{{ log_dir }}/{{ inventory_hostname }}-setup.log"
+        STATE_DIR: "{{ state_dir }}"
+        MAX_RETRIES: "{{ max_retries }}"
+        NODE_ROLE: "{{ node_role }}"
+        NAMENODE_HOST: "{{ hostvars[namenode_host]['ansible_host'] }}"
+
+    - name: "STEP 9: Display results"
+      debug:
+        msg: |
+          STEP 9 - Role Initialization: {{ 'COMPLETED' if step9_status.stat.exists else ('SUCCESS' if step9_result is defined and step9_result.rc == 0 else 'FAILED') }}
+
+    # ===== WAIT FOR ECOSYSTEM STABILIZATION =====
+    - name: "Wait for ecosystem to stabilize"
+      pause:
+        seconds: 120
+      when: node_role == "namenode"
+
+    # ===== FINAL VERIFICATION =====
+    - name: "FINAL: Execute Comprehensive Verification"
+      command: "{{ script_dir }}/run_ecosystem_step.sh verify_full_ecosystem"
+      register: final_result
+      timeout: 600
+      environment:
+        HOME: "/home/ubuntu"
+        USER: "ubuntu"
+        LOG_FILE: "{{ log_dir }}/{{ inventory_hostname }}-setup.log"
+        STATE_DIR: "{{ state_dir }}"
+        NODE_ROLE: "{{ node_role }}"
+
+    - name: "FINAL: Display verification results"
+      debug:
+        msg: |
+          Final Ecosystem Verification on {{ inventory_hostname }}: {{ 'SUCCESS' if final_result.rc == 0 else 'FAILED' }}
+          Role: {{ node_role }}
+          {% if final_result.stdout %}
+          Output: {{ final_result.stdout }}
+          {% endif %}
+
+    # ===== COPY LOGS =====
+    - name: "Copy logs back to local"
+      fetch:
+        src: "{{ log_dir }}/{{ inventory_hostname }}-setup.log"
+        dest: "./logs/{{ inventory_hostname }}-ecosystem-setup.log"
+        flat: yes
+      ignore_errors: yes
+
+    - name: "Display individual node completion"
+      debug:
+        msg: |
+          ===============================================
+          Node Ecosystem Setup Complete: {{ inventory_hostname }}
+          ===============================================
+          Role: {{ node_role }}
+          IP: {{ ansible_host }}
+          Status: {{ 'SUCCESS' if final_result.rc == 0 else 'FAILED' }}
+          Log: ./logs/{{ inventory_hostname }}-ecosystem-setup.log
+          ===============================================
+
+# ===== ECOSYSTEM-WIDE VERIFICATION =====
+- name: Final Hadoop Ecosystem Verification and Status
+  hosts: hadoop
+  become: no
+  gather_facts: no
+  run_once: true
+  vars:
+    script_dir: "/home/ubuntu/hadoop-scripts"
+
+  tasks:
+    - name: "Final ecosystem verification"
+      command: "{{ script_dir }}/cluster_health_full.sh"
+      register: final_verification
+      timeout: 600
+      environment:
+        HOME: "/home/ubuntu"
+        USER: "ubuntu"
+        HADOOP_HOME: "{{ hadoop_home }}"
+        SPARK_HOME: "{{ spark_home }}"
+        HIVE_HOME: "{{ hive_home }}"
+        HBASE_HOME: "{{ hbase_home }}"
+        KAFKA_HOME: "{{ kafka_home }}"
+        FLINK_HOME: "{{ flink_home }}"
+      delegate_to: "{{ groups['namenode'][0] }}"
+      ignore_errors: yes
+
+    - name: "Generate comprehensive configuration files"
+      template:
+        src: "templates/{{ item.src }}"
+        dest: "{{ item.dest }}"
+        mode: "{{ item.mode | default('0644') }}"
+      loop:
+        - { src: "hadoop-ecosystem-info.j2", dest: "./hadoop-ecosystem-info.yml" }
+        - { src: "start-full-ecosystem.sh.j2", dest: "./scripts/start-full-ecosystem.sh", mode: "0755" }
+        - { src: "stop-full-ecosystem.sh.j2", dest: "./scripts/stop-full-ecosystem.sh", mode: "0755" }
+        - { src: "ecosystem-health-check.sh.j2", dest: "./scripts/ecosystem-health-check.sh", mode: "0755" }
+        - { src: "ecosystem-summary.md.j2", dest: "./hadoop-ecosystem-complete.md" }
+        - { src: "service-urls.j2", dest: "./service-urls.txt" }
+      delegate_to: localhost
+      become: no
+
+    - name: "Display final success message"
+      debug:
+        msg: |
+          ===============================================
+          🎉 COMPLETE HADOOP ECOSYSTEM SETUP FINISHED! 🎉
+          ===============================================
+
+          Your comprehensive big data ecosystem is ready!
+
+          📊 INSTALLED COMPONENTS:
+          ✅ Hadoop (HDFS + YARN)    ✅ Spark              ✅ Flink
+          ✅ Hive                     ✅ HBase              ✅ Cassandra
+          ✅ Kafka                    ✅ Zookeeper          ✅ NiFi
+          ✅ Storm                    ✅ Presto             ✅ Drill
+          ✅ Solr                     ✅ Elasticsearch      ✅ MongoDB
+          ✅ Sqoop                    ✅ Flume              ✅ Oozie
+          ✅ Mahout                   ✅ Airflow
+
+          🌐 ACCESS POINTS:
+          - NameNode: http://{{ hostvars[groups['namenode'][0]]['ansible_host'] }}:9870
+          - YARN: http://{{ hostvars[groups['namenode'][0]]['ansible_host'] }}:8088
+          - Spark: http://{{ hostvars[groups['namenode'][0]]['ansible_host'] }}:8080
+          - HBase: http://{{ hostvars[groups['namenode'][0]]['ansible_host'] }}:16010
+          
+          📁 FILES CREATED:
+          - hadoop-ecosystem-info.yml
+          - scripts/start-full-ecosystem.sh
+          - scripts/stop-full-ecosystem.sh
+          - scripts/ecosystem-health-check.sh
+          - service-urls.txt
+          - hadoop-ecosystem-complete.md
+
+          All logs saved to ./logs/ directory
+          ===============================================
