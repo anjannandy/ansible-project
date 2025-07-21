@@ -68,7 +68,7 @@
     oozie_home: "/opt/oozie"
     
     # Configuration
-    max_retries: 3
+    max_retries: 1
     script_dir: "/home/ubuntu/hadoop-scripts"
     state_dir: "/var/lib/hadoop-setup-state"
     log_dir: "/home/ubuntu/hadoop-setup-logs"
@@ -116,6 +116,44 @@
         - install_streaming.sh
         - install_tools.sh
 
+    - name: "Fix script format and permissions"
+      shell: |
+        cd {{ script_dir }}
+
+        # Install dos2unix if not available
+        if ! command -v dos2unix &> /dev/null; then
+          sudo apt-get update -qq
+          sudo apt-get install -y dos2unix
+        fi
+
+        # Convert line endings for all shell scripts
+        for script in *.sh; do
+          if [[ -f "$script" ]]; then
+            echo "Processing $script..."
+
+            # Convert line endings
+            dos2unix "$script" 2>/dev/null || sed -i 's/\r$//' "$script"
+
+            # Ensure proper shebang
+            if ! head -1 "$script" | grep -q "^#!/bin/bash"; then
+              echo "Adding shebang to $script"
+              tmpfile=$(mktemp)
+              echo "#!/bin/bash" > "$tmpfile"
+              tail -n +1 "$script" >> "$tmpfile"
+              mv "$tmpfile" "$script"
+            fi
+
+            # Set executable permissions
+            chmod +x "$script"
+
+            echo "Fixed: $script"
+          fi
+        done
+
+        echo "All scripts processed."
+      args:
+        executable: /bin/bash
+
     - name: "Create remote directories for state and logs"
       become: yes
       file:
@@ -135,7 +173,9 @@
       register: step1_status
 
     - name: "STEP 1: Execute Java & System Preparation"
-      command: "{{ script_dir }}/run_ecosystem_step.sh prepare_system"
+      shell: |
+        export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:$PATH"
+        {{ script_dir }}/run_ecosystem_step.sh prepare_system
       register: step1_result
       retries: "{{ max_retries }}"
       delay: 30
@@ -145,10 +185,25 @@
       environment:
         HOME: "/home/ubuntu"
         USER: "ubuntu"
+        PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
         LOG_FILE: "{{ log_dir }}/{{ inventory_hostname }}-setup.log"
         STATE_DIR: "{{ state_dir }}"
         MAX_RETRIES: "{{ max_retries }}"
         JAVA_VERSION: "{{ java_version }}"
+        HADOOP_HOME: "{{ hadoop_home }}"
+        HIVE_HOME: "{{ hive_home }}"
+        SQOOP_HOME: "{{ sqoop_home }}"
+        FLUME_HOME: "{{ flume_home }}"
+        OOZIE_HOME: "{{ oozie_home }}"
+        HADOOP_VERSION: "{{ hadoop_version }}"
+        HIVE_VERSION: "{{ hive_version }}"
+        SQOOP_VERSION: "{{ sqoop_version }}"
+        FLUME_VERSION: "{{ flume_version }}"
+        OOZIE_VERSION: "{{ oozie_version }}"
+      args:
+        executable: /bin/bash
+
+
 
     - name: "STEP 1: Display results"
       debug:
