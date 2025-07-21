@@ -1,0 +1,69 @@
+# Hadoop Ecosystem Information
+cluster_name: "hadoop-big-data-ecosystem"
+setup_date: "{{ ansible_date_time.iso8601 }}"
+setup_by: "Ansible Automation"
+
+# Component Versions
+components:
+  java: "OpenJDK {{ java_version }}"
+  hadoop: "{{ hadoop_version }}"
+  spark: "{{ spark_version }}"
+  flink: "{{ flink_version }}"
+  hive: "{{ hive_version }}"
+  hbase: "{{ hbase_version }}"
+  cassandra: "{{ cassandra_version }}"
+  mongodb: "{{ mongodb_version }}"
+  kafka: "{{ kafka_version }}"
+  nifi: "{{ nifi_version }}"
+  storm: "{{ storm_version }}"
+  zookeeper: "{{ zookeeper_version }}"
+  presto: "{{ presto_version }}"
+  drill: "{{ drill_version }}"
+  sqoop: "{{ sqoop_version }}"
+  flume: "{{ flume_version }}"
+  mahout: "{{ mahout_version }}"
+  solr: "{{ solr_version }}"
+  elasticsearch: "{{ elasticsearch_version }}"
+  oozie: "{{ oozie_version }}"
+  airflow: "{{ airflow_version }}"
+
+# Cluster Topology
+nodes:
+{% for host in groups['hadoop'] %}
+  - name: "{{ host }}"
+    ip: "{{ hostvars[host]['ansible_host'] }}"
+    role: "{{ hostvars[host]['node_role'] }}"
+    status: "configured"
+{% endfor %}
+
+# Installation Paths
+installation_paths:
+  hadoop_home: "{{ hadoop_home }}"
+  spark_home: "{{ spark_home }}"
+  flink_home: "{{ flink_home }}"
+  hive_home: "{{ hive_home }}"
+  hbase_home: "{{ hbase_home }}"
+  kafka_home: "{{ kafka_home }}"
+  zookeeper_home: "{{ zookeeper_home }}"
+  data_directory: "/data"
+  logs_directory: "/home/ubuntu/hadoop-setup-logs"
+
+# Access URLs
+web_interfaces:
+  hadoop_namenode: "http://{{ hostvars[groups['namenode'][0]]['ansible_host'] }}:9870"
+  yarn_resourcemanager: "http://{{ hostvars[groups['namenode'][0]]['ansible_host'] }}:8088"
+  spark_master: "http://{{ hostvars[groups['namenode'][0]]['ansible_host'] }}:8080"
+  hbase_master: "http://{{ hostvars[groups['namenode'][0]]['ansible_host'] }}:16010"
+  solr: "http://{{ hostvars[groups['namenode'][0]]['ansible_host'] }}:8983"
+  elasticsearch: "http://{{ hostvars[groups['namenode'][0]]['ansible_host'] }}:9200"
+  nifi: "http://{{ hostvars[groups['namenode'][0]]['ansible_host'] }}:8443/nifi"
+
+# Configuration Details
+configuration:
+  hdfs_replication_factor: 3
+  yarn_memory_allocation: "4096mb"
+  spark_executor_memory: "2g"
+  kafka_log_retention_hours: 168
+  zookeeper_data_dir: "/data/zookeeper"
+  hdfs_namenode_dir: "/data/hdfs/namenode"
+  hdfs_datanode_dir: "/data/hdfs/datanode"

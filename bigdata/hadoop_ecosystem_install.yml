@@ -31,7 +31,6 @@
     
     # Coordination & management
     zookeeper_version: "3.8.2"
-    ambari_version: "2.7.5"
     
     # Data ingestion & ETL
     sqoop_version: "1.4.7"
@@ -47,9 +46,6 @@
     # Workflow management
     oozie_version: "5.2.1"
     airflow_version: "2.7.3"
-    
-    # Monitoring & metrics
-    ganglia_version: "3.7.2"
     
     # Installation paths
     hadoop_home: "/opt/hadoop"
@@ -507,12 +503,12 @@
       debug:
         msg: |
           ===============================================
-          🎉 COMPLETE HADOOP ECOSYSTEM SETUP FINISHED! 🎉
+           COMPLETE HADOOP ECOSYSTEM SETUP FINISHED! 
           ===============================================
 
           Your comprehensive big data ecosystem is ready!
 
-          📊 INSTALLED COMPONENTS:
+           INSTALLED COMPONENTS:
           ✅ Hadoop (HDFS + YARN)    ✅ Spark              ✅ Flink
           ✅ Hive                     ✅ HBase              ✅ Cassandra
           ✅ Kafka                    ✅ Zookeeper          ✅ NiFi
@@ -521,13 +517,13 @@
           ✅ Sqoop                    ✅ Flume              ✅ Oozie
           ✅ Mahout                   ✅ Airflow
 
-          🌐 ACCESS POINTS:
+           ACCESS POINTS:
           - NameNode: http://{{ hostvars[groups['namenode'][0]]['ansible_host'] }}:9870
           - YARN: http://{{ hostvars[groups['namenode'][0]]['ansible_host'] }}:8088
           - Spark: http://{{ hostvars[groups['namenode'][0]]['ansible_host'] }}:8080
           - HBase: http://{{ hostvars[groups['namenode'][0]]['ansible_host'] }}:16010
           
-          📁 FILES CREATED:
+           FILES CREATED:
           - hadoop-ecosystem-info.yml
           - scripts/start-full-ecosystem.sh
           - scripts/stop-full-ecosystem.sh

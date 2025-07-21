@@ -1,0 +1,27 @@
+all:
+  children:
+    hadoop:
+      children:
+        namenode:
+          hosts:
+            hadoop-master:
+              ansible_host: 192.168.1.190
+              node_role: namenode
+        datanode:
+          hosts:
+            hadoop-node1:
+              ansible_host: 192.168.1.191
+              node_role: datanode
+            hadoop-node2:
+              ansible_host: 192.168.1.192
+              node_role: datanode
+            hadoop-node3:
+              ansible_host: 192.168.1.193
+              node_role: datanode
+            hadoop-node4:
+              ansible_host: 192.168.1.194
+              node_role: datanode
+  vars:
+    ansible_user: ubuntu
+    ansible_ssh_private_key_file: ~/.ssh/id_rsa
+    ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
