@@ -1,3 +1,4 @@
+
 #!/bin/bash
 
 # Hadoop Ecosystem Utilities
@@ -157,23 +158,63 @@ download_and_extract() {
     /usr/bin/mkdir -p "$temp_dir"
 
     log_info "Downloading $archive_name..."
-    if ! /usr/bin/curl -L -o "$temp_dir/$archive_name" "$url"; then
-        log_error "Failed to download $archive_name"
+    if ! /usr/bin/curl -L -f -o "$temp_dir/$archive_name" "$url"; then
+        log_error "Failed to download $archive_name from $url"
         return 1
     fi
+
+    # Verify the downloaded file exists and has content
+    if [[ ! -f "$temp_dir/$archive_name" ]] || [[ ! -s "$temp_dir/$archive_name" ]]; then
+        log_error "Downloaded file is empty or doesn't exist: $temp_dir/$archive_name"
+        return 1
+    fi
+
+    # Check file type to determine extraction method
+    local file_type
+    file_type=$(/usr/bin/file "$temp_dir/$archive_name" 2>/dev/null)
+    log_info "File type: $file_type"
 
     log_info "Extracting $archive_name to $dest_dir..."
     /usr/bin/sudo /usr/bin/mkdir -p "$dest_dir"
 
-    if [[ "$archive_name" == *.tar.gz ]] || [[ "$archive_name" == *.tgz ]]; then
-        /usr/bin/sudo /usr/bin/tar -xzf "$temp_dir/$archive_name" -C "$dest_dir" --strip-components=1
-    elif [[ "$archive_name" == *.tar ]]; then
-        /usr/bin/sudo /usr/bin/tar -xf "$temp_dir/$archive_name" -C "$dest_dir" --strip-components=1
-    elif [[ "$archive_name" == *.zip ]]; then
-        /usr/bin/sudo /usr/bin/unzip -q "$temp_dir/$archive_name" -d "$temp_dir/extract"
-        /usr/bin/sudo /usr/bin/cp -r "$temp_dir/extract"/*/* "$dest_dir/"
+    # Try different extraction methods based on file type and extension
+    if [[ "$file_type" == *"gzip compressed"* ]] || [[ "$archive_name" == *.tar.gz ]] || [[ "$archive_name" == *.tgz ]]; then
+        if ! /usr/bin/sudo /usr/bin/tar -xzf "$temp_dir/$archive_name" -C "$dest_dir" --strip-components=1 2>/dev/null; then
+            log_error "Failed to extract gzipped tar archive: $archive_name"
+            # Try without gzip decompression in case it's not actually compressed
+            if ! /usr/bin/sudo /usr/bin/tar -xf "$temp_dir/$archive_name" -C "$dest_dir" --strip-components=1 2>/dev/null; then
+                log_error "Failed to extract archive even without gzip: $archive_name"
+                return 1
+            fi
+        fi
+    elif [[ "$file_type" == *"POSIX tar archive"* ]] || [[ "$archive_name" == *.tar ]]; then
+        if ! /usr/bin/sudo /usr/bin/tar -xf "$temp_dir/$archive_name" -C "$dest_dir" --strip-components=1; then
+            log_error "Failed to extract tar archive: $archive_name"
+            return 1
+        fi
+    elif [[ "$file_type" == *"Zip archive"* ]] || [[ "$archive_name" == *.zip ]]; then
+        local extract_temp="$temp_dir/extract_$$"
+        /usr/bin/mkdir -p "$extract_temp"
+        if ! /usr/bin/sudo /usr/bin/unzip -q "$temp_dir/$archive_name" -d "$extract_temp"; then
+            log_error "Failed to extract zip archive: $archive_name"
+            return 1
+        fi
+        # Find the top-level directory and copy contents
+        local top_dir
+        top_dir=$(/usr/bin/find "$extract_temp" -maxdepth 1 -type d -not -path "$extract_temp" | head -1)
+        if [[ -n "$top_dir" ]]; then
+            /usr/bin/sudo /usr/bin/cp -r "$top_dir"/* "$dest_dir/"
+        else
+            /usr/bin/sudo /usr/bin/cp -r "$extract_temp"/* "$dest_dir/"
+        fi
+        /usr/bin/rm -rf "$extract_temp"
+    elif [[ "$file_type" == *"HTML document"* ]] || [[ "$file_type" == *"ASCII text"* ]]; then
+        log_error "Downloaded file appears to be HTML/text instead of an archive. URL may be incorrect: $url"
+        log_info "First few lines of downloaded file:"
+        /usr/bin/head -5 "$temp_dir/$archive_name" 2>/dev/null || true
+        return 1
     else
-        log_error "Unsupported archive format: $archive_name"
+        log_error "Unsupported archive format: $archive_name (detected: $file_type)"
         return 1
     fi
 

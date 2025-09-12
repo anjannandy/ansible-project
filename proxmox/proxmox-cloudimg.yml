@@ -1,0 +1,182 @@
+---
+- name: Provision Ubuntu Noble VM on Proxmox with Cloud-Init
+  hosts: proxmox
+  become: true
+  gather_facts: false
+
+  vars:
+    # Core settings
+    vmid: 503
+    vm_name: ubuntu-noble-test
+    memory: 4096
+    cores: 4
+    disk_size: "128G"
+    bridge: vmbr0
+    storage: local-lvm
+    image_dir: /var/lib/vm-cloudimg
+
+    # Ubuntu Noble cloud image (KVM-optimized)
+    image_url: https://cloud-images.ubuntu.com/noble/20250805/noble-server-cloudimg-amd64.img
+    sha256sums_url: https://cloud-images.ubuntu.com/noble/20250805/SHA256SUMS
+    image_filename: noble-server-cloudimg-amd64.img
+    ci_hostname: nanlabvm01serv01
+
+    # Cloud-Init config
+    ci_user: anandy
+    ci_password: welcome
+
+    # Networking
+    ipconfig0: "ip=10.0.1.2/16,gw=10.0.0.1"
+    nameserver: "8.8.8.8"
+    searchdomain: "local"
+
+  tasks:
+    - name: Ensure image directory exists
+      ansible.builtin.file:
+        path: "{{ image_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Download Ubuntu Noble cloud image
+      ansible.builtin.get_url:
+        url: "{{ image_url }}"
+        dest: "{{ image_dir }}/{{ image_filename }}"
+        mode: '0644'
+        force: false
+
+    - name: Create VM shell if not exists
+      ansible.builtin.command: >
+        qm create {{ vmid }}
+        --name {{ vm_name }}
+        --memory {{ memory }}
+        --cores {{ cores }}
+        --net0 virtio,bridge={{ bridge }}
+        --scsihw virtio-scsi-pci
+        --ostype l26
+      args:
+        creates: "/etc/pve/qemu-server/{{ vmid }}.conf"
+
+    - name: Import disk and attach as scsi0 if not already present
+      ansible.builtin.shell: |
+        set -e
+        if ! qm config {{ vmid }} | grep -q '^scsi0:'; then
+          qm importdisk {{ vmid }} "{{ image_dir }}/{{ image_filename }}" {{ storage }}
+          qm set {{ vmid }} --scsi0 {{ storage }}:vm-{{ vmid }}-disk-0
+        fi
+      args:
+        executable: /bin/bash
+
+    - name: Resize disk
+      ansible.builtin.command: >
+        qm resize {{ vmid }} scsi0 {{ disk_size }}
+
+    - name: Add cloud-init drive and set boot options
+      ansible.builtin.shell: |
+        set -e
+        qm set {{ vmid }} --ide2 {{ storage }}:cloudinit
+        qm set {{ vmid }} --boot c --bootdisk scsi0
+        qm set {{ vmid }} --serial0 socket --vga serial0
+        qm set {{ vmid }} --agent enabled=1
+      args:
+        executable: /bin/bash
+
+    - name: Ensure /tmp directory for SSH keys exists
+      ansible.builtin.file:
+        path: "/tmp/vm-setup"
+        state: directory
+        mode: '0755'
+
+    - name: Copy SSH public key to Proxmox server
+      ansible.builtin.copy:
+        src: "~/.ssh/id_rsa.pub"
+        dest: "/tmp/vm-setup/{{ vm_name }}-id_rsa.pub"
+        mode: '0644'
+
+    - name: Set Cloud-Init basic configuration
+      ansible.builtin.shell: |
+        # Set user and password
+        qm set {{ vmid }} --ciuser {{ ci_user }}
+        qm set {{ vmid }} --cipassword {{ ci_password }}
+        
+        # Set networking
+        qm set {{ vmid }} --ipconfig0 {{ ipconfig0 }}
+        qm set {{ vmid }} --nameserver {{ nameserver }}
+        qm set {{ vmid }} --searchdomain {{ searchdomain }}
+        
+        # Set SSH key from copied file
+        qm set {{ vmid }} --sshkey /tmp/vm-setup/{{ vm_name }}-id_rsa.pub
+      args:
+        executable: /bin/bash
+
+    - name: Regenerate cloud-init drive
+      ansible.builtin.command: qm cloudinit update {{ vmid }}
+
+    - name: Start VM
+      ansible.builtin.shell: |
+        if ! qm status {{ vmid }} | grep -q 'status: running'; then
+          qm start {{ vmid }}
+        fi
+      args:
+        executable: /bin/bash
+
+    - name: Wait for VM to boot and stabilize
+      ansible.builtin.pause:
+        seconds: 90
+
+    - name: Test SSH connectivity
+      ansible.builtin.wait_for:
+        host: "10.0.1.2"
+        port: 22
+        delay: 10
+        timeout: 300
+      register: ssh_test
+      ignore_errors: yes
+
+    - name: Display connection status
+      ansible.builtin.debug:
+        msg: |
+          ===============================================
+          VM Creation Complete!
+          ===============================================
+          VM ID: {{ vmid }}
+          Name: {{ vm_name }}
+          IP: 10.0.1.2
+          User: {{ ci_user }}
+          Password: {{ ci_password }}
+          SSH Port: {{ 'OPEN' if ssh_test is succeeded else 'NOT READY' }}
+          
+          Connection methods:
+          1. SSH with key: ssh {{ ci_user }}@10.0.1.2
+          2. SSH with password: ssh -o PreferredAuthentications=password {{ ci_user }}@10.0.1.2
+          3. Proxmox Console: https://{{ ansible_host }}:8006
+          
+          ===============================================
+
+    - name: Verify SSH key authentication
+      ansible.builtin.command: >
+        ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no 
+        {{ ci_user }}@10.0.1.2 'echo "SSH key authentication successful"'
+      register: ssh_key_test
+      ignore_errors: yes
+      delegate_to: localhost
+      become: false
+
+    - name: Display SSH test results
+      ansible.builtin.debug:
+        msg: |
+          SSH Key Test: {{ 'SUCCESS' if ssh_key_test.rc == 0 else 'FAILED' }}
+          {% if ssh_key_test.rc == 0 %}
+          ✅ You can now connect with: ssh {{ ci_user }}@10.0.1.2
+          {% else %}
+          ❌ SSH key authentication failed. Try password: ssh -o PreferredAuthentications=password {{ ci_user }}@10.0.1.2
+          
+          Debug steps:
+          1. Check VM console for cloud-init logs
+          2. Verify SSH service: ssh {{ ci_user }}@10.0.1.2 'sudo systemctl status ssh'
+          3. Check authorized_keys: ssh {{ ci_user }}@10.0.1.2 'cat ~/.ssh/authorized_keys'
+          {% endif %}
+
+    - name: Clean up temporary SSH key file
+      ansible.builtin.file:
+        path: "/tmp/vm-setup/{{ vm_name }}-id_rsa.pub"
+        state: absent
