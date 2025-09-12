@@ -5,12 +5,18 @@
   gather_facts: false
 
   vars:
-    # Core settings
-    vmid: 503
-    vm_name: ubuntu-noble-test
-    memory: 4096
-    cores: 4
-    disk_size: "128G"
+    # Core settings - These will be provided as extra vars
+    vmid: "{{ vm_id | default(503) }}"
+    vm_name: "{{ vm_hostname | default('ubuntu-noble-test') }}"
+    ci_hostname: "{{ vm_hostname | default('ubuntu-noble-test') }}"
+    vm_ip: "{{ vm_ip_address | default('10.0.1.2') }}"
+    vm_gateway: "{{ vm_gateway | default('10.0.0.1') }}"
+    vm_netmask: "{{ netmask | default('16') }}"
+
+    memory: "{{ vm_memory | default(4096) }}"
+    cores: "{{ vm_cores | default(4) }}"
+    disk_size: "{{ vm_disk_size | default('128G') }}"
+
     bridge: vmbr0
     storage: local-lvm
     image_dir: /var/lib/vm-cloudimg
@@ -19,18 +25,32 @@
     image_url: https://cloud-images.ubuntu.com/noble/20250805/noble-server-cloudimg-amd64.img
     sha256sums_url: https://cloud-images.ubuntu.com/noble/20250805/SHA256SUMS
     image_filename: noble-server-cloudimg-amd64.img
-    ci_hostname: nanlabvm01serv01
 
     # Cloud-Init config
     ci_user: anandy
     ci_password: welcome
 
     # Networking
-    ipconfig0: "ip=10.0.1.2/16,gw=10.0.0.1"
+    ipconfig0: "ip={{ vm_ip }}/{{ vm_netmask }},gw={{ vm_gateway }}"
     nameserver: "8.8.8.8"
     searchdomain: "local"
 
   tasks:
+    - name: Display VM configuration
+      ansible.builtin.debug:
+        msg:
+          - "=================================================="
+          - "        VM PROVISIONING CONFIGURATION"
+          - "=================================================="
+          - "VM ID: {{ vmid }}"
+          - "VM Name/Hostname: {{ vm_name }}"
+          - "IP Address: {{ vm_ip }}/{{ vm_netmask }}"
+          - "Gateway: {{ vm_gateway }}"
+          - "Memory: {{ memory }}MB"
+          - "Cores: {{ cores }}"
+          - "Disk Size: {{ disk_size }}"
+          - "=================================================="
+
     - name: Ensure image directory exists
       ansible.builtin.file:
         path: "{{ image_dir }}"
@@ -125,7 +145,7 @@
 
     - name: Test SSH connectivity
       ansible.builtin.wait_for:
-        host: "10.0.1.2"
+        host: "{{ vm_ip }}"
         port: 22
         delay: 10
         timeout: 300
@@ -134,28 +154,28 @@
 
     - name: Display connection status
       ansible.builtin.debug:
-        msg: |
-          ===============================================
-          VM Creation Complete!
-          ===============================================
-          VM ID: {{ vmid }}
-          Name: {{ vm_name }}
-          IP: 10.0.1.2
-          User: {{ ci_user }}
-          Password: {{ ci_password }}
-          SSH Port: {{ 'OPEN' if ssh_test is succeeded else 'NOT READY' }}
-          
-          Connection methods:
-          1. SSH with key: ssh {{ ci_user }}@10.0.1.2
-          2. SSH with password: ssh -o PreferredAuthentications=password {{ ci_user }}@10.0.1.2
-          3. Proxmox Console: https://{{ ansible_host }}:8006
-          
-          ===============================================
+        msg:
+          - "=================================================="
+          - "           VM CREATION COMPLETE!"
+          - "=================================================="
+          - "VM ID: {{ vmid }}"
+          - "VM Name: {{ vm_name }}"
+          - "Hostname: {{ ci_hostname }}"
+          - "IP Address: {{ vm_ip }}"
+          - "User: {{ ci_user }}"
+          - "Password: {{ ci_password }}"
+          - "SSH Port Status: {{ 'OPEN' if ssh_test is succeeded else 'NOT READY' }}"
+          - ""
+          - "Connection Methods:"
+          - "  1. SSH with key: ssh {{ ci_user }}@{{ vm_ip }}"
+          - "  2. SSH with password: ssh -o PreferredAuthentications=password {{ ci_user }}@{{ vm_ip }}"
+          - "  3. Proxmox Console: https://{{ ansible_host }}:8006"
+          - "=================================================="
 
     - name: Verify SSH key authentication
       ansible.builtin.command: >
         ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no 
-        {{ ci_user }}@10.0.1.2 'echo "SSH key authentication successful"'
+        {{ ci_user }}@{{ vm_ip }} 'echo "SSH key authentication successful"'
       register: ssh_key_test
       ignore_errors: yes
       delegate_to: localhost
@@ -163,18 +183,19 @@
 
     - name: Display SSH test results
       ansible.builtin.debug:
-        msg: |
-          SSH Key Test: {{ 'SUCCESS' if ssh_key_test.rc == 0 else 'FAILED' }}
-          {% if ssh_key_test.rc == 0 %}
-          ✅ You can now connect with: ssh {{ ci_user }}@10.0.1.2
-          {% else %}
-          ❌ SSH key authentication failed. Try password: ssh -o PreferredAuthentications=password {{ ci_user }}@10.0.1.2
-          
-          Debug steps:
-          1. Check VM console for cloud-init logs
-          2. Verify SSH service: ssh {{ ci_user }}@10.0.1.2 'sudo systemctl status ssh'
-          3. Check authorized_keys: ssh {{ ci_user }}@10.0.1.2 'cat ~/.ssh/authorized_keys'
-          {% endif %}
+        msg:
+          - "=================================================="
+          - "           SSH CONNECTION TEST"
+          - "=================================================="
+          - "SSH Key Test: {{ 'SUCCESS ✅' if ssh_key_test.rc == 0 else 'FAILED ❌' }}"
+          - ""
+          - "{% if ssh_key_test.rc == 0 %}Ready to connect: ssh {{ ci_user }}@{{ vm_ip }}{% else %}Try password authentication: ssh -o PreferredAuthentications=password {{ ci_user }}@{{ vm_ip }}{% endif %}"
+          - ""
+          - "Debug commands (if needed):"
+          - "  - Check cloud-init logs: ssh {{ ci_user }}@{{ vm_ip }} 'sudo cat /var/log/cloud-init.log'"
+          - "  - Check SSH service: ssh {{ ci_user }}@{{ vm_ip }} 'sudo systemctl status ssh'"
+          - "  - Check authorized_keys: ssh {{ ci_user }}@{{ vm_ip }} 'cat ~/.ssh/authorized_keys'"
+          - "=================================================="
 
     - name: Clean up temporary SSH key file
       ansible.builtin.file:
