@@ -1,11 +1,18 @@
 ---
-# ===== USER CREATION (Parallel within step) =====
-- name: Create kubeadmin user on all nodes
+# ===== USER CREATION AND SSH KEY SETUP (using existing user) =====
+- name: Create and configure kubeadmin user on all nodes
   hosts: kubernetes
   become: no
   gather_facts: yes
   strategy: free  # Parallel execution within this step
+  vars:
+    ansible_user: "{{ hostvars[inventory_hostname]['ansible_user'] | default('anandy') }}"
+
   tasks:
+    - name: Display current connection user
+      debug:
+        msg: "Connecting to {{ inventory_hostname }} as {{ ansible_user }}"
+
     - name: Check if kubeadmin user exists
       getent:
         database: passwd
@@ -13,16 +20,66 @@
       register: kubeadmin_exists
       failed_when: false
 
-    - name: Create kubeadmin user
-      script: ../scripts/user-management/create_kubeadmin.sh
-      register: user_creation_result
+    - name: Create kubeadmin user if it doesn't exist
+      become: yes
+      user:
+        name: kubeadmin
+        groups: sudo,docker
+        shell: /bin/bash
+        create_home: yes
+        append: yes
       when: kubeadmin_exists.failed
 
-    - name: Display user creation result
-      debug:
-        msg: "kubeadmin user: {{ 'Already exists' if not kubeadmin_exists.failed else 'Created' }}"
+    - name: Ensure docker group exists
+      become: yes
+      group:
+        name: docker
+        state: present
 
-# ===== STEP 1: SYSTEM PREPARATION (Parallel within step) =====
+    - name: Add kubeadmin to docker group (always)
+      become: yes
+      user:
+        name: kubeadmin
+        groups: docker
+        append: yes
+
+    - name: Set up SSH key for kubeadmin (always run)
+      become: yes
+      authorized_key:
+        user: kubeadmin
+        state: present
+        key: "{{ lookup('file', '~/.ssh/id_rsa.pub') }}"
+        exclusive: no
+
+    - name: Add kubeadmin to sudoers with no password (always run)
+      become: yes
+      lineinfile:
+        path: /etc/sudoers.d/kubeadmin
+        line: 'kubeadmin ALL=(ALL) NOPASSWD:ALL'
+        create: yes
+        mode: '0440'
+
+    - name: Test SSH connection to kubeadmin
+      become: no
+      vars:
+        ansible_user: kubeadmin
+      ping:
+      register: ssh_test
+      ignore_errors: yes
+
+    - name: Display user setup result
+      debug:
+        msg:
+          - "kubeadmin user: {{ 'Already existed' if not kubeadmin_exists.failed else 'Created' }}"
+          - "SSH key setup: {{ 'SUCCESS' if ssh_test is succeeded else 'FAILED' }}"
+          - "Ready for Kubernetes setup: {{ 'YES' if ssh_test is succeeded else 'NO' }}"
+
+    - name: Fail if SSH test failed
+      fail:
+        msg: "SSH connection to kubeadmin user failed. Cannot proceed with Kubernetes setup."
+      when: ssh_test is failed
+
+# ===== STEP 1: SYSTEM PREPARATION =====
 - name: STEP 1 - System Preparation
   hosts: kubernetes
   become: no
@@ -65,6 +122,7 @@
         - utils.sh
         - run_step.sh
         - cluster_status.sh
+      become: yes
 
     - name: Check if system preparation already completed
       stat:
@@ -72,7 +130,7 @@
       register: step1_status
 
     - name: Execute system preparation
-      command: "{{ kubeadm_script_dir }}/run_step.sh system_prep"
+      command: "{{ kubeadmin_script_dir }}/run_step.sh system_prep"
       register: step1_result
       retries: "{{ max_retries }}"
       delay: 30
@@ -89,7 +147,7 @@
       debug:
         msg: "✅ STEP 1 - System prep on {{ inventory_hostname }}: {{ 'SKIPPED (already completed)' if step1_status.stat.exists else ('SUCCESS' if step1_result is defined and step1_result.rc == 0 else 'FAILED') }}"
 
-# ===== STEP 2: DOCKER INSTALLATION (Parallel within step) =====
+# ===== STEP 2: DOCKER INSTALLATION =====
 - name: STEP 2 - Docker Installation
   hosts: kubernetes
   become: no
@@ -117,6 +175,7 @@
         name: docker
       register: docker_service_status
       failed_when: false
+      become: yes
       when: not step2_status.stat.exists
 
     - name: Install Docker
@@ -139,7 +198,7 @@
       debug:
         msg: "✅ STEP 2 - Docker install on {{ inventory_hostname }}: {{ 'SKIPPED (already completed)' if step2_status.stat.exists or (docker_service_status is defined and docker_service_status.status.ActiveState == 'active') else ('SUCCESS' if step2_result is defined and step2_result.rc == 0 else 'FAILED') }}"
 
-# ===== STEP 3: KUBERNETES INSTALLATION (Parallel within step) =====
+# ===== STEP 3: KUBERNETES INSTALLATION =====
 - name: STEP 3 - Kubernetes Installation
   hosts: kubernetes
   become: no
@@ -188,7 +247,7 @@
       debug:
         msg: "✅ STEP 3 - Kubernetes install on {{ inventory_hostname }}: {{ 'SKIPPED (already completed)' if step3_status.stat.exists or (kubectl_check is defined and kubectl_check.rc == 0) else ('SUCCESS' if step3_result is defined and step3_result.rc == 0 else 'FAILED') }}"
 
-# ===== STEP 4: SYSTEM CONFIGURATION (Parallel within step) =====
+# ===== STEP 4: SYSTEM CONFIGURATION =====
 - name: STEP 4 - System Configuration
   hosts: kubernetes
   become: no
@@ -280,53 +339,94 @@
       debug:
         msg: "✅ STEP 5 - Master init: {{ 'SKIPPED (already completed)' if master_status.stat.exists or (cluster_check is defined and cluster_check.rc == 0) else ('SUCCESS' if master_result is defined and master_result.rc == 0 else 'FAILED') }}"
 
-# ===== STEP 6: CNI INSTALLATION (Serial - only master node) =====
+# ===== STEP 6: CNI INSTALLATION (Simplified) =====
 - name: STEP 6 - CNI Installation
   hosts: master
   become: no
   gather_facts: no
-  strategy: linear  # Only master node
+  strategy: linear
   vars:
     ansible_user: kubeadmin
-    kubeadmin_script_dir: "/home/kubeadmin/k8s-scripts"
-    kubeadmin_log_dir: "/home/kubeadmin/k8s-setup-logs"
-    kubeadmin_state_dir: "/home/kubeadmin/k8s-setup-state"
 
   tasks:
     - name: Display step 6 start
       debug:
         msg: "🌐 STEP 6: Starting CNI installation on {{ inventory_hostname }}"
 
-    - name: Check if CNI already installed
+    - name: Check if CNI already installed (state file)
       stat:
-        path: "{{ kubeadmin_state_dir }}/06_cni_install_completed"
+        path: "/home/kubeadmin/k8s-setup-state/06_cni_install_completed"
       register: cni_status
 
-    - name: Check if flannel pods are running
-      command: kubectl get pods -n kube-flannel -o json
-      register: flannel_check
+    - name: Check if flannel is actually running
+      shell: |
+        kubectl get pods -n kube-flannel --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l
+      register: flannel_running_count
       failed_when: false
       environment:
         HOME: "/home/kubeadmin"
         KUBECONFIG: "/home/kubeadmin/.kube/config"
       when: not cni_status.stat.exists
 
+    - name: Debug CNI status
+      debug:
+        msg: |
+          CNI Status Check:
+          - State file exists: {{ cni_status.stat.exists }}
+          - Running flannel pods: {{ flannel_running_count.stdout | default('not checked') }}
+          - Will install CNI: {{ not cni_status.stat.exists and (flannel_running_count.stdout | default('0') | int == 0) }}
+      when: flannel_running_count is defined
+
     - name: Install CNI (Flannel)
-      command: "{{ kubeadmin_script_dir }}/run_step.sh install_cni"
+      command: kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
       register: cni_result
       when:
         - not cni_status.stat.exists
-        - flannel_check is not defined or flannel_check.rc != 0
-      timeout: 600
+        - flannel_running_count is defined
+        - flannel_running_count.stdout | int == 0
+      timeout: 300
       environment:
         HOME: "/home/kubeadmin"
-        LOG_FILE: "{{ kubeadmin_log_dir }}/{{ inventory_hostname }}-setup.log"
-        STATE_DIR: "{{ kubeadmin_state_dir }}"
-        K8S_ADMIN_USER: "kubeadmin"
+        KUBECONFIG: "/home/kubeadmin/.kube/config"
 
-    - name: Display CNI install results
+    - name: Wait for flannel pods to be ready
+      command: kubectl wait --for=condition=ready pod -l app=flannel -n kube-flannel --timeout=300s
+      when:
+        - cni_result is defined
+        - cni_result.changed
+      environment:
+        HOME: "/home/kubeadmin"
+        KUBECONFIG: "/home/kubeadmin/.kube/config"
+      ignore_errors: yes
+
+    - name: Verify CNI installation
+      shell: kubectl get nodes --no-headers | grep -v NotReady | wc -l
+      register: ready_nodes_count
+      environment:
+        HOME: "/home/kubeadmin"
+        KUBECONFIG: "/home/kubeadmin/.kube/config"
+      when:
+        - cni_result is defined
+        - cni_result.changed
+
+    - name: Mark CNI installation as completed
+      file:
+        path: "/home/kubeadmin/k8s-setup-state/06_cni_install_completed"
+        state: touch
+        mode: '0644'
+      when:
+        - cni_result is defined
+        - cni_result.changed
+        - cni_result.rc == 0
+
+    - name: Display step 6 results
       debug:
-        msg: "✅ STEP 6 - CNI install: {{ 'SKIPPED (already completed)' if cni_status.stat.exists or (flannel_check is defined and flannel_check.rc == 0) else ('SUCCESS' if cni_result is defined and cni_result.rc == 0 else 'FAILED') }}"
+        msg: |
+          ✅ STEP 6 - CNI Installation Results:
+          {{ 'SKIPPED (already completed)' if cni_status.stat.exists else 
+             ('SUCCESS - CNI installed' if (cni_result is defined and cni_result.changed) else 
+             'SKIPPED (flannel already running)') }}
+          
 
 # ===== STEP 7: WORKER JOIN (Parallel within step) =====
 - name: STEP 7 - Worker Join
@@ -365,7 +465,8 @@
       delegate_to: "{{ groups['master'][0] }}"
       when:
         - not worker_status.stat.exists
-        - node_check is not defined or node_check.rc != 0
+        - node_check is defined
+        - node_check.rc != 0
 
     - name: Write join command to worker
       copy:
@@ -374,34 +475,51 @@
         mode: '0755'
       when:
         - not worker_status.stat.exists
-        - node_check is not defined or node_check.rc != 0
+        - node_check is defined
+        - node_check.rc != 0
         - join_command_content is defined
+        - join_command_content.content is defined
 
     - name: Execute join command
       command: "sudo bash /tmp/kubeadm-join-command.sh"
-      register: worker_result
+      register: worker_join_result
       timeout: 600
       when:
         - not worker_status.stat.exists
-        - node_check is not defined or node_check.rc != 0
+        - node_check is defined
+        - node_check.rc != 0
         - join_command_content is defined
+        - join_command_content.content is defined
 
-    - name: Mark worker join as completed
+    - name: Mark worker join as completed (when join was executed successfully)
       file:
         path: "{{ kubeadmin_state_dir }}/07_worker_join_completed"
         state: touch
         mode: '0644'
-      when: worker_result is defined and worker_result.rc == 0
+      when:
+        - worker_join_result is defined
+        - worker_join_result.rc is defined
+        - worker_join_result.rc == 0
+
+    - name: Mark worker join as completed (when already in cluster)
+      file:
+        path: "{{ kubeadmin_state_dir }}/07_worker_join_completed"
+        state: touch
+        mode: '0644'
+      when:
+        - worker_status.stat.exists or (node_check is defined and node_check.rc == 0)
 
     - name: Clean up join command file
       file:
         path: "/tmp/kubeadm-join-command.sh"
         state: absent
-      when: join_command_content is defined
+      when:
+        - join_command_content is defined
+        - join_command_content.content is defined
 
     - name: Display worker join results
       debug:
-        msg: "✅ STEP 7 - Worker join on {{ inventory_hostname }}: {{ 'SKIPPED (already joined)' if worker_status.stat.exists or (node_check is defined and node_check.rc == 0) else ('SUCCESS' if worker_result is defined and worker_result.rc == 0 else 'FAILED') }}"
+        msg: "✅ STEP 7 - Worker join on {{ inventory_hostname }}: {{ 'SKIPPED (already completed)' if worker_status.stat.exists else ('SKIPPED (already in cluster)' if (node_check is defined and node_check.rc == 0) else ('SUCCESS' if (worker_join_result is defined and worker_join_result.rc is defined and worker_join_result.rc == 0) else 'SKIPPED (conditions not met)')) }}"
 
 # ===== STEP 8: FINAL STATUS (Serial - only master node) =====
 - name: STEP 8 - Final Cluster Status
@@ -430,43 +548,41 @@
         HOME: "/home/kubeadmin"
         KUBECONFIG: "/home/kubeadmin/.kube/config"
 
-    - name: Get final cluster status
-      command: "{{ kubeadmin_script_dir }}/cluster_status.sh"
-      register: final_status
+    - name: Get cluster info
+      command: kubectl cluster-info --request-timeout=10s
+      register: cluster_info_raw
       environment:
         HOME: "/home/kubeadmin"
         KUBECONFIG: "/home/kubeadmin/.kube/config"
 
-    - name: Display final status
-      debug:
-        msg: |
-          🎉 KUBERNETES CLUSTER STATUS 🎉
-          {{ final_status.stdout }}
+    - name: Get nodes info
+      command: kubectl get nodes -o wide --no-headers
+      register: nodes_info_raw
+      environment:
+        HOME: "/home/kubeadmin"
+        KUBECONFIG: "/home/kubeadmin/.kube/config"
 
-    - name: Display comprehensive summary
+    - name: Display final cluster status
       debug:
         msg: |
           ================================================================
-          📊 KUBERNETES CLUSTER SETUP COMPLETE! 📊
+          🎉 KUBERNETES CLUSTER SETUP COMPLETE! 🎉
           ================================================================
           
-          🎯 CLUSTER OVERVIEW
-          Total Nodes: {{ groups['kubernetes'] | length }}
-          Master Nodes: {{ groups['master'] | length }}  
-          Worker Nodes: {{ groups['workers'] | length }}
+          📊 CLUSTER SUMMARY:
+          • Total Nodes: {{ groups['kubernetes'] | length }}
+          • Master Nodes: {{ groups['master'] | length }}
+          • Worker Nodes: {{ groups['workers'] | length }}
           
-          📋 EXECUTION STRATEGY
-          ✅ Steps 1-4: Parallel execution within each step
-          ✅ Steps 5-6: Serial execution (master only)
-          ✅ Step 7: Parallel worker joins
-          ✅ Step 8: Final status check
+          🖥️  NODES:
+          {% for line in nodes_info_raw.stdout_lines %}
+          {% set node_info = line.split() %}
+          • {{ node_info[0] }}: {{ node_info[1] }} ({{ node_info[2] if node_info[2] != '<none>' else 'worker' }})
+          {% endfor %}
           
-          🚀 PERFORMANCE BENEFITS
-          • Parallel system prep across all nodes
-          • Parallel Docker installation
-          • Parallel Kubernetes installation  
-          • Parallel system configuration
-          • Parallel worker joins
+          🔑 ACCESS:
+          • SSH: ssh kubeadmin@{{ ansible_default_ipv4.address }}
+          • Config: /home/kubeadmin/.kube/config
           
-          🎯 All nodes ready for workloads!
+          🚀 READY FOR WORKLOADS!
           ================================================================
