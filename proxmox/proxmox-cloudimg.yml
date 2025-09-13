@@ -33,7 +33,7 @@
     # Networking
     ipconfig0: "ip={{ vm_ip }}/{{ vm_netmask }},gw={{ vm_gateway }}"
     nameserver: "8.8.8.8"
-    searchdomain: "local"
+    searchdomain: "an.homelab.com"
 
   tasks:
     - name: Display VM configuration
