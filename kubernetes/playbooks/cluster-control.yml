@@ -1,0 +1,76 @@
+---
+- name: Kubernetes Cluster Control
+  hosts: kubernetes
+  become: yes
+  gather_facts: no
+  vars:
+    action: "{{ cluster_action | default('status') }}"
+    ansible_user: kubeadmin
+
+  tasks:
+    - name: Display action
+      debug:
+        msg: "Executing {{ action }} on {{ inventory_hostname }}"
+
+    - name: Stop cluster services
+      systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: no
+      loop:
+        - kubelet
+        - docker
+        - containerd
+      when: action == 'stop'
+      ignore_errors: yes
+
+    - name: Start cluster services
+      systemd:
+        name: "{{ item }}"
+        state: started
+        enabled: yes
+      loop:
+        - containerd
+        - docker
+        - kubelet
+      when: action == 'start'
+
+    - name: Get service status
+      command: systemctl is-active "{{ item }}"
+      register: service_status
+      loop:
+        - kubelet
+        - docker
+        - containerd
+      when: action == 'status'
+      ignore_errors: yes
+
+    - name: Display service status
+      debug:
+        msg: "{{ item.item }}: {{ item.stdout | default('inactive') }}"
+      loop: "{{ service_status.results | default([]) }}"
+      when: action == 'status'
+
+    - name: Reset cluster (DANGER - removes all cluster data)
+      block:
+        - name: Reset kubeadm
+          command: kubeadm reset --force
+          ignore_errors: yes
+
+        - name: Clean up iptables
+          shell: |
+            iptables -F && iptables -t nat -F && iptables -t mangle -F && iptables -X
+          ignore_errors: yes
+
+        - name: Remove cluster directories
+          file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - /etc/kubernetes
+            - /var/lib/etcd
+            - /home/kubeadmin/.kube
+            - "{{ state_dir }}"
+          ignore_errors: yes
+
+      when: action == 'reset'

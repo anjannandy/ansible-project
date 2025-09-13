@@ -1,0 +1,28 @@
+
+---
+# Kubernetes specific configuration
+kubernetes_version: "1.30"
+kubernetes_minor_version: "1.30.0-1.1"
+pod_network_cidr: "10.244.0.0/16"
+service_subnet: "10.96.0.0/12"
+cluster_name: "kubernetes"
+
+# Container runtime
+container_runtime: containerd
+containerd_version: "1.7.22"
+
+# CNI Plugin
+cni_plugin: flannel
+flannel_version: "v0.25.6"
+
+# Docker configuration
+docker_version: "5:27.1.1-1~ubuntu.24.04~noble"
+
+# Node roles (can be overridden in inventory)
+node_role: worker
+
+
+# System configuration
+disable_swap: true
+enable_ip_forward: true
+load_kernel_modules: true

@@ -1,0 +1,18 @@
+---
+# Global variables available to all plays
+script_dir: "/home/anandy/k8s-scripts"
+log_dir: "/home/anandy/k8s-setup-logs"
+state_dir: "/home/anandy/k8s-state"
+
+# Kubeadmin paths
+kubeadmin_script_dir: "/home/kubeadmin/k8s-scripts"
+kubeadmin_log_dir: "/home/kubeadmin/k8s-setup-logs"
+kubeadmin_state_dir: "/home/kubeadmin/k8s-state"
+
+# Kubernetes configuration
+kubernetes_version: "1.30"
+pod_network_cidr: "10.244.0.0/16"
+max_retries: 3
+command_timeout: 300
+wait_delay: 10
+node_role: worker

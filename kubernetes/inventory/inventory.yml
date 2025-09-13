@@ -1,0 +1,38 @@
+all:
+  children:
+    kubernetes:
+      children:
+        master:
+          hosts:
+            ub2404vm01srv01:
+              ansible_host: 10.0.1.1
+              ansible_user: anandy
+              node_role: master
+              vm_name: ub2404vm01srv01
+              vm_id: 501
+        workers:
+          hosts:
+            ub2404vm02srv01:
+              ansible_host: 10.0.1.2
+              ansible_user: anandy
+              node_role: worker
+              vm_name: ub2404vm02srv01
+              vm_id: 502
+            ub2404vm03srv01:
+              ansible_host: 10.0.1.3
+              ansible_user: anandy
+              node_role: worker
+              vm_name: ub2404vm03srv01
+              vm_id: 503
+            ub2404vm04srv01:
+              ansible_host: 10.0.1.4
+              ansible_user: anandy
+              node_role: worker
+              vm_name: ub2404vm04srv01
+              vm_id: 504
+            ub2404vm05srv01:
+              ansible_host: 10.0.1.5
+              ansible_user: anandy
+              node_role: worker
+              vm_name: ub2404vm05srv01
+              vm_id: 505

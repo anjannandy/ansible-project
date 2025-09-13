@@ -1,0 +1,99 @@
+---
+- name: Kubernetes Node Management
+  hosts: localhost
+  gather_facts: no
+  vars:
+    action: "{{ node_action | default('list') }}"  # add, remove, list
+    target_node: "{{ node_name | default('') }}"
+    master_node: "{{ groups['master'][0] }}"
+
+  tasks:
+    - name: List cluster nodes
+      delegate_to: "{{ hostvars[master_node]['ansible_host'] }}"
+      vars:
+        ansible_user: kubeadmin
+      command: kubectl get nodes -o wide
+      register: node_list
+      when: action == 'list'
+      environment:
+        KUBECONFIG: /home/kubeadmin/.kube/config
+
+    - name: Display current nodes
+      debug:
+        msg: |
+          Current cluster nodes:
+          {{ node_list.stdout }}
+      when: action == 'list'
+
+    - name: Add new worker node
+      block:
+        - name: Prepare new node
+          include_tasks: kubernetes-setup.yml
+          vars:
+            target_hosts: "{{ target_node }}"
+
+        - name: Verify node joined
+          delegate_to: "{{ hostvars[master_node]['ansible_host'] }}"
+          vars:
+            ansible_user: kubeadmin
+          command: kubectl get nodes
+          register: nodes_after_add
+          environment:
+            KUBECONFIG: /home/kubeadmin/.kube/config
+
+        - name: Display updated node list
+          debug:
+            msg: |
+              Nodes after adding {{ target_node }}:
+              {{ nodes_after_add.stdout }}
+
+      when: action == 'add' and target_node != ''
+
+    - name: Remove node from cluster
+      block:
+        - name: Drain node
+          delegate_to: "{{ hostvars[master_node]['ansible_host'] }}"
+          vars:
+            ansible_user: kubeadmin
+          command: kubectl drain {{ target_node }} --ignore-daemonsets --delete-emptydir-data --force
+          environment:
+            KUBECONFIG: /home/kubeadmin/.kube/config
+          ignore_errors: yes
+
+        - name: Delete node from cluster
+          delegate_to: "{{ hostvars[master_node]['ansible_host'] }}"
+          vars:
+            ansible_user: kubeadmin
+          command: kubectl delete node {{ target_node }}
+          environment:
+            KUBECONFIG: /home/kubeadmin/.kube/config
+          ignore_errors: yes
+
+        - name: Reset node
+          delegate_to: "{{ target_node }}"
+          vars:
+            ansible_user: kubeadmin
+          become: yes
+          command: kubeadm reset --force
+          ignore_errors: yes
+
+        - name: Display removal confirmation
+          debug:
+            msg: "Node {{ target_node }} removed from cluster"
+
+      when: action == 'remove' and target_node != ''
+
+    - name: Show usage
+      debug:
+        msg: |
+          Usage examples:
+          
+          List nodes:
+          ansible-playbook -i inventory/inventory.yml playbooks/node-management.yml
+          
+          Add node:
+          ansible-playbook -i inventory/inventory.yml playbooks/node-management.yml -e node_action=add -e node_name=new_worker
+          
+          Remove node:
+          ansible-playbook -i inventory/inventory.yml playbooks/node-management.yml -e node_action=remove -e node_name=worker_to_remove
+      when: action not in ['list', 'add', 'remove'] or (action in ['add', 'remove'] and target_node == '')

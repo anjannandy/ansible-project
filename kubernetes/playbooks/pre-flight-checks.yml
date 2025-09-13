@@ -1,0 +1,226 @@
+---
+- name: Kubernetes Pre-flight Checks
+  hosts: kubernetes
+  become: no
+  gather_facts: yes
+  vars:
+    ansible_user: anandy
+    
+  tasks:
+    - name: Check system requirements
+      block:
+        - name: Check minimum RAM (2GB)
+          assert:
+            that:
+              - ansible_memtotal_mb >= 1536
+            fail_msg: "Insufficient RAM. Need at least 2GB, found {{ ansible_memtotal_mb }}MB"
+            success_msg: "✅ RAM check passed: {{ ansible_memtotal_mb }}MB"
+
+        - name: Check minimum CPU (2 cores)
+          assert:
+            that:
+              - ansible_processor_vcpus >= 2
+            fail_msg: "Insufficient CPU cores. Need at least 2, found {{ ansible_processor_vcpus }}"
+            success_msg: "✅ CPU check passed: {{ ansible_processor_vcpus }} cores"
+
+        - name: Check disk space (20GB)
+          assert:
+            that:
+              - ansible_mounts | selectattr('mount', 'equalto', '/') | map(attribute='size_available') | first > 21474836480
+            fail_msg: "Insufficient disk space. Need at least 20GB available"
+            success_msg: "✅ Disk space check passed"
+
+    - name: Check network connectivity
+      block:
+        - name: Test internet connectivity
+          uri:
+            url: https://www.google.com
+            method: HEAD
+            timeout: 10
+            status_code: [200, 301, 302]
+          register: internet_check
+
+        - name: Test Docker Hub connectivity (using curl like your working test)
+          shell: curl -s --connect-timeout 5 https://index.docker.io/v1/ > /dev/null
+          register: docker_hub_check
+          failed_when: docker_hub_check.rc != 0
+
+        - name: Test Kubernetes package repository
+          uri:
+            url: https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release
+            method: HEAD
+            timeout: 10
+            status_code: [200, 301, 302]
+          register: k8s_repo_check
+
+        - name: Test Docker repository connectivity
+          uri:
+            url: https://download.docker.com/linux/ubuntu/dists/
+            method: HEAD
+            timeout: 10
+            status_code: [200, 301, 302]
+          register: docker_repo_check
+
+    - name: Check DNS resolution
+      block:
+        - name: Test DNS resolution for critical services
+          shell: nslookup {{ item }} > /dev/null 2>&1
+          register: dns_check
+          failed_when: false
+          loop:
+            - google.com
+            - docker.io
+            - pkgs.k8s.io
+
+    - name: Check for conflicting software
+      block:
+        - name: Check if Docker is already installed
+          command: docker --version
+          register: docker_installed
+          failed_when: false
+
+        - name: Check if Kubernetes is already installed
+          command: kubectl version --client
+          register: kubectl_installed
+          failed_when: false
+
+        - name: Check if swap is enabled
+          command: swapon --show
+          register: swap_check
+          failed_when: false
+
+        - name: Check critical ports availability
+          wait_for:
+            port: "{{ item.port }}"
+            host: "{{ ansible_default_ipv4.address }}"
+            timeout: 1
+          register: port_check
+          failed_when: false
+          loop:
+            - { port: 6443, name: "Kubernetes API" }
+            - { port: 10250, name: "Kubelet API" }
+            - { port: 2379, name: "etcd client" }
+            - { port: 2380, name: "etcd peer" }
+          when: node_role == 'master'
+
+        - name: Check worker node ports
+          wait_for:
+            port: "{{ item.port }}"
+            host: "{{ ansible_default_ipv4.address }}"
+            timeout: 1
+          register: worker_port_check
+          failed_when: false
+          loop:
+            - { port: 10250, name: "Kubelet API" }
+            - { port: 30000, name: "NodePort start" }
+          when: node_role == 'worker'
+
+    - name: Display comprehensive pre-flight results
+      debug:
+        msg: |
+          ================================================================
+          PRE-FLIGHT CHECK RESULTS for {{ inventory_hostname }}
+          ================================================================
+          
+          🖥️  SYSTEM REQUIREMENTS
+          ✅ RAM: {{ ansible_memtotal_mb }}MB ({{ (ansible_memtotal_mb/1024)|round(1) }}GB)
+          ✅ CPU: {{ ansible_processor_vcpus }} cores
+          ✅ Disk Space: Available
+          ✅ OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+          ✅ Kernel: {{ ansible_kernel }}
+          ✅ Architecture: {{ ansible_architecture }}
+          
+          🌐 NETWORK CONNECTIVITY
+          {{ '✅' if internet_check is succeeded else '❌' }} Internet: {{ 'PASSED' if internet_check is succeeded else 'FAILED' }}
+          {{ '✅' if docker_hub_check.rc == 0 else '❌' }} Docker Hub: {{ 'PASSED' if docker_hub_check.rc == 0 else 'FAILED' }}
+          {{ '✅' if k8s_repo_check is succeeded else '❌' }} Kubernetes Repo: {{ 'PASSED' if k8s_repo_check is succeeded else 'FAILED' }}
+          {{ '✅' if docker_repo_check is succeeded else '❌' }} Docker Repo: {{ 'PASSED' if docker_repo_check is succeeded else 'FAILED' }}
+          
+          🔍 DNS RESOLUTION
+          {% for result in dns_check.results %}
+          {{ '✅' if result.rc == 0 else '❌' }} {{ result.item }}: {{ 'OK' if result.rc == 0 else 'FAILED' }}
+          {% endfor %}
+          
+          📦 CURRENT SOFTWARE
+          - Docker: {{ 'Installed (' + docker_installed.stdout + ')' if docker_installed.rc == 0 else 'Not installed' }}
+          - Kubectl: {{ 'Installed' if kubectl_installed.rc == 0 else 'Not installed' }}
+          - Swap: {{ 'Enabled (will be disabled)' if swap_check.stdout != '' else 'Disabled ✅' }}
+          
+          🔌 PORT AVAILABILITY ({{ node_role | default('unknown') }} node)
+          {% if port_check is defined %}
+          {% for result in port_check.results %}
+          {{ '⚠️' if result is succeeded else '✅' }} Port {{ result.item.port }} ({{ result.item.name }}): {{ 'IN USE' if result is succeeded else 'AVAILABLE' }}
+          {% endfor %}
+          {% endif %}
+          {% if worker_port_check is defined %}
+          {% for result in worker_port_check.results %}
+          {{ '⚠️' if result is succeeded else '✅' }} Port {{ result.item.port }} ({{ result.item.name }}): {{ 'IN USE' if result is succeeded else 'AVAILABLE' }}
+          {% endfor %}
+          {% endif %}
+          
+          📊 OVERALL STATUS
+          Node Role: {{ node_role | default('unknown') }}
+          Ready for K8s: {{ '✅ YES' if (internet_check is succeeded and docker_hub_check.rc == 0 and k8s_repo_check is succeeded) else '❌ NO (check network)' }}
+          
+          ================================================================
+
+    - name: Check for critical failures
+      fail:
+        msg: |
+          ================================================================
+          ❌ CRITICAL PRE-FLIGHT CHECK FAILURES ❌
+          ================================================================
+          
+          {{ inventory_hostname }} failed critical connectivity tests:
+          {% if internet_check is failed %}
+          🌐 Internet connectivity FAILED - Cannot reach external sites
+          {% endif %}
+          {% if docker_hub_check.rc != 0 %}
+          🐳 Docker Hub connectivity FAILED - Cannot reach Docker registry  
+          {% endif %}
+          {% if k8s_repo_check is failed %}
+          ☸️  Kubernetes repository FAILED - Cannot reach K8s packages
+          {% endif %}
+          {% if docker_repo_check is failed %}
+          📦 Docker repository FAILED - Cannot reach Docker packages
+          {% endif %}
+          
+          🔧 TROUBLESHOOTING STEPS:
+          1. SSH to the failing node: ssh {{ ansible_user }}@{{ ansible_host }}
+          2. Test connectivity manually:
+             curl -v https://www.google.com
+             curl -v https://index.docker.io/v1/
+             curl -v https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release
+          3. Check DNS: nslookup google.com
+          4. Check firewall: sudo ufw status
+          
+          ================================================================
+      when: >
+        internet_check is failed or 
+        docker_hub_check.rc != 0 or 
+        k8s_repo_check is failed or 
+        docker_repo_check is failed
+
+    - name: Display success summary
+      debug:
+        msg: |
+          ================================================================
+          🎉 ALL PRE-FLIGHT CHECKS PASSED! 🎉
+          ================================================================
+          
+          {{ inventory_hostname }} ({{ ansible_host }}) is READY for Kubernetes!
+          
+          💾 System: {{ ansible_memtotal_mb }}MB RAM, {{ ansible_processor_vcpus }} CPU cores
+          🌐 Network: All connectivity tests passed
+          📦 Repositories: Docker Hub, Kubernetes, Docker packages accessible
+          🔌 Ports: Available for Kubernetes services
+          
+          🚀 Ready to proceed with installation:
+          ansible-playbook -i inventory/inventory.yml playbooks/kubernetes-setup.yml
+          
+          ================================================================
+      when: >
+        internet_check is succeeded and 
+        docker_hub_check.rc == 0 and 
+        k8s_repo_check is succeeded and 
+        docker_repo_check is succeeded
