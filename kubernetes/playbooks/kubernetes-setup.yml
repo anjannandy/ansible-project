@@ -1,83 +1,24 @@
----
-# ===== USER CREATION AND SSH KEY SETUP (using existing user) =====
-- name: Create and configure kubeadmin user on all nodes
+# ===== USER CREATION (Parallel within step) =====
+- name: Create kubeadmin user on all nodes
   hosts: kubernetes
   become: no
   gather_facts: yes
   strategy: free  # Parallel execution within this step
-  vars:
-    ansible_user: "{{ hostvars[inventory_hostname]['ansible_user'] | default('anandy') }}"
-
   tasks:
-    - name: Display current connection user
-      debug:
-        msg: "Connecting to {{ inventory_hostname }} as {{ ansible_user }}"
-
     - name: Check if kubeadmin user exists
-      getent:
-        database: passwd
-        key: kubeadmin
-      register: kubeadmin_exists
+      shell: id kubeadmin
+      register: user_check
       failed_when: false
+      changed_when: false
 
-    - name: Create kubeadmin user if it doesn't exist
-      become: yes
-      user:
-        name: kubeadmin
-        groups: sudo,docker
-        shell: /bin/bash
-        create_home: yes
-        append: yes
-      when: kubeadmin_exists.failed
+    - name: Create kubeadmin user
+      script: ../scripts/user-management/create_kubeadmin.sh
+      register: user_creation_result
+      when: user_check.rc != 0  # Run when 'id kubeadmin' returns non-zero (user doesn't exist)
 
-    - name: Ensure docker group exists
-      become: yes
-      group:
-        name: docker
-        state: present
-
-    - name: Add kubeadmin to docker group (always)
-      become: yes
-      user:
-        name: kubeadmin
-        groups: docker
-        append: yes
-
-    - name: Set up SSH key for kubeadmin (always run)
-      become: yes
-      authorized_key:
-        user: kubeadmin
-        state: present
-        key: "{{ lookup('file', '~/.ssh/id_rsa.pub') }}"
-        exclusive: no
-
-    - name: Add kubeadmin to sudoers with no password (always run)
-      become: yes
-      lineinfile:
-        path: /etc/sudoers.d/kubeadmin
-        line: 'kubeadmin ALL=(ALL) NOPASSWD:ALL'
-        create: yes
-        mode: '0440'
-
-    - name: Test SSH connection to kubeadmin
-      become: no
-      vars:
-        ansible_user: kubeadmin
-      ping:
-      register: ssh_test
-      ignore_errors: yes
-
-    - name: Display user setup result
+    - name: Display user creation result
       debug:
-        msg:
-          - "kubeadmin user: {{ 'Already existed' if not kubeadmin_exists.failed else 'Created' }}"
-          - "SSH key setup: {{ 'SUCCESS' if ssh_test is succeeded else 'FAILED' }}"
-          - "Ready for Kubernetes setup: {{ 'YES' if ssh_test is succeeded else 'NO' }}"
-
-    - name: Fail if SSH test failed
-      fail:
-        msg: "SSH connection to kubeadmin user failed. Cannot proceed with Kubernetes setup."
-      when: ssh_test is failed
+        msg: "kubeadmin user: {{ 'Created' if user_check.rc != 0 else 'Already exists' }}"
 
 # ===== STEP 1: SYSTEM PREPARATION =====
 - name: STEP 1 - System Preparation
