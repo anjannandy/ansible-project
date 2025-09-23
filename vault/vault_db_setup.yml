@@ -1,0 +1,80 @@
+- name: Prepare PostgreSQL for Vault
+  hosts: postgres_host
+  become: yes
+  vars:
+    vault_db_name: vault
+    vault_db_user: vault_admin
+    vault_db_password: vault_admin_123
+    vault_schema: vault_store
+    vault_table: vault_kv_store
+    vault_unseal_table: vault_unseal_keys
+    pg_port: 5433
+    pg_host: "127.0.0.1"
+    pg_admin_user: "postgres"
+    pg_admin_password: "postgres_password"
+
+  tasks:
+
+    - name: Install psycopg2 for Ansible PostgreSQL modules
+      apt:
+        name: python3-psycopg2
+        state: present
+        update_cache: yes
+
+    - name: Ensure PostgreSQL is installed
+      apt:
+        name: postgresql
+        state: present
+
+    - name: Ensure Vault database exists
+      postgresql_db:
+        name: "{{ vault_db_name }}"
+        state: present
+        login_host: "{{ pg_host }}"
+        login_user: "{{ pg_admin_user }}"
+        login_password: "{{ pg_admin_password }}"
+        port: "{{ pg_port }}"
+
+    - name: Ensure Vault user exists
+      postgresql_user:
+        name: "{{ vault_db_user }}"
+        password: "{{ vault_db_password }}"
+        state: present
+        login_host: "{{ pg_host }}"
+        login_user: "{{ pg_admin_user }}"
+        login_password: "{{ pg_admin_password }}"
+        port: "{{ pg_port }}"
+
+    - name: Grant privileges to Vault user
+      postgresql_privs:
+        db: "{{ vault_db_name }}"
+        role: "{{ vault_db_user }}"
+        type: database
+        privs: ALL
+        login_host: "{{ pg_host }}"
+        login_user: "{{ pg_admin_user }}"
+        login_password: "{{ pg_admin_password }}"
+        port: "{{ pg_port }}"
+
+    - name: Create Vault schema
+      postgresql_query:
+        db: "{{ vault_db_name }}"
+        query: "CREATE SCHEMA IF NOT EXISTS {{ vault_schema }} AUTHORIZATION {{ vault_db_user }};"
+        login_host: "{{ pg_host }}"
+        login_user: "{{ pg_admin_user }}"
+        login_password: "{{ pg_admin_password }}"
+        port: "{{ pg_port }}"
+
+    - name: Create unseal key table
+      postgresql_query:
+        db: "{{ vault_db_name }}"
+        query: >
+          CREATE TABLE IF NOT EXISTS {{ vault_schema }}.{{ vault_unseal_table }} (
+            id SERIAL PRIMARY KEY,
+            key TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          );
+        login_host: "{{ pg_host }}"
+        login_user: "{{ pg_admin_user }}"
+        login_password: "{{ pg_admin_password }}"
+        port: "{{ pg_port }}"
