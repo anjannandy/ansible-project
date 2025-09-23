@@ -6,16 +6,17 @@
     vault_api_port: 8200
     vault_cluster_port: 8201
     vault_config_path: "/etc/vault.d"
-    vault_node_id: "{{ inventory_hostname }}"
     vault_db_host: "10.0.2.20"
     vault_db_port: 5433
     vault_db_name: "vault"
     vault_db_user: "vault_admin"
     vault_db_password: "vault_admin_123"
-    vault_schema: "vault_store"
+    vault_schema: "public"
     vault_table: "vault_kv_store"
     vault_unseal_table: "vault_unseal_keys"
     vault_unseal_key_path: "/root/unseal.keys"
+    postgres_admin_user: "postgres"
+    postgres_admin_password: "postgres_password"
 
   tasks:
 
@@ -24,8 +25,16 @@
         name:
           - unzip
           - curl
+          - postgresql-client
         state: present
         update_cache: yes
+      tags: ['install']
+
+    - name: Check if Vault binary exists
+      stat:
+        path: /usr/local/bin/vault
+      register: vault_binary_check
+      tags: ['install', 'always']
 
     - name: Create vault user
       user:
@@ -34,12 +43,14 @@
         shell: /bin/false
         home: /etc/vault.d
         createhome: no
+      tags: ['install']
 
     - name: Download Vault binary
       get_url:
         url: "https://releases.hashicorp.com/vault/{{ vault_version }}/vault_{{ vault_version }}_linux_amd64.zip"
         dest: "/tmp/vault.zip"
-      when: not ansible_local.vault_installed is defined
+      when: not vault_binary_check.stat.exists
+      tags: ['install']
 
     - name: Unpack Vault
       unarchive:
@@ -49,12 +60,8 @@
         owner: root
         group: root
         mode: '0755'
-      when: not ansible_local.vault_installed is defined
-
-    - name: Mark Vault installed
-      set_fact:
-        ansible_local:
-          vault_installed: true
+      when: not vault_binary_check.stat.exists
+      tags: ['install']
 
     - name: Create Vault config directory
       file:
@@ -63,6 +70,7 @@
         owner: vault
         group: vault
         mode: '0750'
+      tags: ['configure']
 
     - name: Create Vault data directory
       file:
@@ -71,6 +79,7 @@
         owner: vault
         group: vault
         mode: '0750'
+      tags: ['configure']
 
     - name: Configure Vault (vault.hcl)
       copy:
@@ -81,7 +90,6 @@
         content: |
           storage "postgresql" {
             connection_url = "postgresql://{{ vault_db_user }}:{{ vault_db_password }}@{{ vault_db_host }}:{{ vault_db_port }}/{{ vault_db_name }}?sslmode=disable"
-            schema_name    = "{{ vault_schema }}"
             table          = "{{ vault_table }}"
           }
 
@@ -93,11 +101,12 @@
           api_addr     = "http://{{ ansible_host }}:{{ vault_api_port }}"
           cluster_addr = "http://{{ ansible_host }}:{{ vault_cluster_port }}"
           cluster_name = "vault-cluster"
-          node_id      = "{{ vault_node_id }}"
           ui           = true
           
           log_level = "INFO"
           log_format = "standard"
+      notify: restart vault
+      tags: ['configure']
 
     - name: Create systemd unit for Vault
       copy:
@@ -137,175 +146,211 @@
 
           [Install]
           WantedBy=multi-user.target
+      notify: reload systemd
+      tags: ['configure']
 
     - name: Reload systemd daemon
       systemd:
         daemon_reload: yes
+      tags: ['configure']
 
     - name: Enable and start Vault
       systemd:
         name: vault
         enabled: yes
         state: started
+      tags: ['start']
 
-    - name: Wait a moment for Vault to initialize
-      pause:
-        seconds: 10
+    - name: Wait for Vault service to be ready
+      wait_for:
+        port: "{{ vault_api_port }}"
+        host: "{{ ansible_host }}"
+        delay: 5
+        timeout: 60
+      tags: ['start']
 
-    - name: Check Vault service status
-      systemd:
-        name: vault
-      register: vault_service_status
-
-    - name: Display Vault service status
-      debug:
-        var: vault_service_status.status
-
-    - name: Get Vault logs if service failed
-      command: journalctl -u vault --no-pager -n 20
-      register: vault_logs
-      when: vault_service_status.status.ActiveState != "active"
-
-    - name: Display Vault logs if service failed
-      debug:
-        var: vault_logs.stdout_lines
-      when: vault_service_status.status.ActiveState != "active"
-
-    - name: Test local connectivity first
-      uri:
-        url: "http://127.0.0.1:{{ vault_api_port }}/v1/sys/health"
-        method: GET
-        status_code: [200, 429, 472, 501, 503]
-      register: vault_local_health
-      retries: 5
-      delay: 3
-      ignore_errors: yes
-
-    - name: Wait for Vault API
+    - name: Test Vault API connectivity
       uri:
         url: "http://{{ ansible_host }}:{{ vault_api_port }}/v1/sys/health"
         method: GET
         status_code: [200, 429, 472, 501, 503]
       register: vault_health
       until: vault_health.status in [200, 429, 472, 501, 503]
-      retries: 15
+      retries: 10
       delay: 5
+      tags: ['verify']
 
-    - name: Check if Vault is initialized (leader only)
+    # Initialization phase
+    - name: Check if Vault is initialized
       uri:
-        url: "http://127.0.0.1:8200/v1/sys/init"
+        url: "http://{{ ansible_host }}:{{ vault_api_port }}/v1/sys/init"
         method: GET
       register: vault_init_status
-      delegate_to: vault-01
+      delegate_to: "{{ groups['vault_nodes'][0] }}"
       run_once: true
+      tags: [ 'init' ]
 
-    - name: Share Vault initialization status
+    - name: Set initialization status fact
       set_fact:
         vault_is_initialized: "{{ vault_init_status.json.initialized }}"
       run_once: true
+      tags: [ 'init' ]
 
+    # Check if unseal keys already exist in database
+    - name: Check for existing unseal keys in database
+      postgresql_query:
+        db: "{{ vault_db_name }}"
+        query: "SELECT key FROM {{ vault_unseal_table }} ORDER BY id;"
+        login_host: "{{ vault_db_host }}"
+        login_user: "{{ postgres_admin_user }}"
+        login_password: "{{ postgres_admin_password }}"
+        port: "{{ vault_db_port }}"
+      register: existing_unseal_keys
+      delegate_to: "{{ groups['postgres_host'][0] }}"
+      become: no
+      run_once: true
+      when: vault_is_initialized
+      tags: [ 'init' ]
+
+    - name: Set unseal keys from database
+      set_fact:
+        vault_unseal_keys: "{{ existing_unseal_keys.query_result | map(attribute='key') | list }}"
+      run_once: true
+      when: vault_is_initialized and existing_unseal_keys.query_result is defined and existing_unseal_keys.query_result | length > 0
+      tags: [ 'init' ]
+
+    # Initialize Vault if not already initialized
     - name: Initialize Vault (leader only)
-      command: vault operator init -key-shares=5 -key-threshold=3
+      command: vault operator init -key-shares=5 -key-threshold=3 -format=json
       environment:
-        VAULT_ADDR: "http://127.0.0.1:8200"
-      when: inventory_hostname == "vault-01" and not vault_is_initialized
+        VAULT_ADDR: "http://127.0.0.1:{{ vault_api_port }}"
+      when:
+        - inventory_hostname == groups['vault_nodes'][0]
+        - not vault_is_initialized
       register: vault_init_output
-      changed_when: "'Unseal Key 1:' in vault_init_output.stdout"
+      tags: [ 'init' ]
 
-    - name: Extract all unseal keys
+    - name: Parse initialization output
       set_fact:
-        vault_unseal_keys: "{{ vault_init_output.stdout_lines | select('search', '^Unseal Key [0-9]+:') | map('regex_replace', '^Unseal Key [0-9]+: ', '') | list }}"
-      when: vault_init_output is defined and vault_init_output.stdout_lines is defined and inventory_hostname == "vault-01"
-
-    - name: Save unseal keys to file
-      copy:
-        dest: "{{ vault_unseal_key_path }}"
-        content: "{{ vault_unseal_keys | join('\n') }}"
-        mode: '0600'
-      when: vault_unseal_keys is defined and inventory_hostname == "vault-01"
-
-    - name: Check if unseal key file exists
-      stat:
-        path: "{{ vault_unseal_key_path }}"
-      register: unseal_file_status
-      delegate_to: vault-01
+        vault_init_data: "{{ vault_init_output.stdout | from_json }}"
+        vault_unseal_keys: "{{ (vault_init_output.stdout | from_json).unseal_keys_b64 }}"
+        vault_root_token: "{{ (vault_init_output.stdout | from_json).root_token }}"
+      when:
+        - vault_init_output is defined
+        - vault_init_output.stdout is defined
+        - inventory_hostname == groups['vault_nodes'][0]
       run_once: true
+      tags: [ 'init' ]
 
-    - name: Read unseal keys from file
-      slurp:
-        src: "{{ vault_unseal_key_path }}"
-      register: unseal_keys_raw
-      delegate_to: vault-01
-      run_once: true
-      when: unseal_file_status.stat.exists
-
-    - name: Decode unseal keys
-      set_fact:
-        vault_unseal_keys: "{{ unseal_keys_raw.content | b64decode | split('\n') | reject('equalto', '') | list }}"
-      run_once: true
-      delegate_to: vault-01
-      when: unseal_keys_raw is defined and unseal_keys_raw.content is defined
-
-    - name: Distribute unseal keys to all nodes
-      set_fact:
-        vault_unseal_keys: "{{ hostvars['vault-01']['vault_unseal_keys'] }}"
-      when: inventory_hostname != "vault-01" and hostvars['vault-01']['vault_unseal_keys'] is defined
-
-    - name: Save unseal keys to DB
+    - name: Save unseal keys to database
       postgresql_query:
         db: "{{ vault_db_name }}"
         query: >
-          INSERT INTO {{ vault_schema }}.{{ vault_unseal_table }} (key)
+          INSERT INTO {{ vault_unseal_table }} (key)
           VALUES {{ vault_unseal_keys | map('regex_replace', '^(.*)$', "('\\1')") | join(', ') }};
         login_host: "{{ vault_db_host }}"
-        login_user: "postgres"
-        login_password: "postgres_password"
+        login_user: "{{ postgres_admin_user }}"
+        login_password: "{{ postgres_admin_password }}"
         port: "{{ vault_db_port }}"
-      delegate_to: db
-      when: vault_unseal_keys is defined and inventory_hostname == "vault-01"
+      delegate_to: "{{ groups['postgres_host'][0] }}"
+      become: no
+      when:
+        - vault_unseal_keys is defined
+        - inventory_hostname == groups['vault_nodes'][0]
+        - not vault_is_initialized
+      run_once: true
+      tags: [ 'init' ]
 
-    - name: Restart Vault on followers to detect initialized backend
-      systemd:
-        name: vault
-        state: restarted
-      when: inventory_hostname != "vault-01" and vault_is_initialized | default(false)
+    - name: Save root token to database (as a separate entry)
+      postgresql_query:
+        db: "{{ vault_db_name }}"
+        query: >
+          INSERT INTO {{ vault_unseal_table }} (key)
+          VALUES ('ROOT_TOKEN:{{ vault_root_token }}');
+        login_host: "{{ vault_db_host }}"
+        login_user: "{{ postgres_admin_user }}"
+        login_password: "{{ postgres_admin_password }}"
+        port: "{{ vault_db_port }}"
+      delegate_to: "{{ groups['postgres_host'][0] }}"
+      become: no
+      when:
+        - vault_root_token is defined
+        - inventory_hostname == groups['vault_nodes'][0]
+        - not vault_is_initialized
+      run_once: true
+      tags: [ 'init' ]
 
-    - name: Wait for Vault API after restart
-      uri:
-        url: "http://{{ ansible_host }}:{{ vault_api_port }}/v1/sys/health"
-        method: GET
-        status_code: [200, 429, 472, 501, 503]
-      register: vault_health_post_restart
-      until: vault_health_post_restart.status in [200, 429, 472, 501, 503]
-      retries: 10
-      delay: 5
-      when: inventory_hostname != "vault-01"
+    # Distribute unseal keys to all nodes
+    - name: Distribute unseal keys to all nodes
+      set_fact:
+        vault_unseal_keys: "{{ hostvars[groups['vault_nodes'][0]]['vault_unseal_keys'] }}"
+      when:
+        - inventory_hostname != groups['vault_nodes'][0]
+        - hostvars[groups['vault_nodes'][0]]['vault_unseal_keys'] is defined
+      tags: ['init']
 
-    - name: Check if Vault is sealed
+    # Unsealing phase
+    - name: Check current seal status
       uri:
         url: "http://{{ ansible_host }}:{{ vault_api_port }}/v1/sys/seal-status"
         method: GET
       register: seal_status
       changed_when: false
+      tags: ['unseal']
 
-    - name: Unseal Vault nodes (use multiple keys for threshold)
-      command: vault operator unseal "{{ item }}"
-      environment:
-        VAULT_ADDR: "http://127.0.0.1:8200"
-      loop: "{{ vault_unseal_keys[:3] }}"  # Use first 3 keys (threshold)
+    - name: Unseal Vault nodes
+      uri:
+        url: "http://{{ ansible_host }}:{{ vault_api_port }}/v1/sys/unseal"
+        method: POST
+        body_format: json
+        body:
+          key: "{{ item }}"
+        status_code: [200]
+      loop: "{{ vault_unseal_keys[:3] }}"
       when:
         - vault_unseal_keys is defined
         - seal_status.json.sealed | default(true)
+      register: unseal_result
       ignore_errors: yes
+      tags: ['unseal']
 
-    - name: Verify cluster status
+    - name: Verify final seal status
+      uri:
+        url: "http://{{ ansible_host }}:{{ vault_api_port }}/v1/sys/seal-status"
+        method: GET
+      register: final_seal_status
+      tags: ['verify']
+
+    - name: Display seal status
+      debug:
+        msg: "Node {{ inventory_hostname }} - Sealed: {{ final_seal_status.json.sealed }}, Progress: {{ final_seal_status.json.progress }}/{{ final_seal_status.json.t }}"
+      tags: ['verify']
+
+    # Cluster verification
+    - name: Check cluster leadership
       uri:
         url: "http://{{ ansible_host }}:{{ vault_api_port }}/v1/sys/leader"
         method: GET
       register: leader_status
       ignore_errors: yes
+      tags: ['verify']
 
-    - name: Display cluster leader information
+    - name: Display cluster information
       debug:
-        var: leader_status.json
+        msg:
+          - "Node: {{ inventory_hostname }}"
+          - "Leader: {{ leader_status.json.is_self | default('unknown') }}"
+          - "Leader Address: {{ leader_status.json.leader_address | default('unknown') }}"
+          - "Cluster ID: {{ leader_status.json.leader_cluster_address | default('unknown') }}"
       when: leader_status.json is defined
+      tags: ['verify']
+
+  handlers:
+    - name: reload systemd
+      systemd:
+        daemon_reload: yes
+
+    - name: restart vault
+      systemd:
+        name: vault
+        state: restarted

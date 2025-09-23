@@ -27,3 +27,20 @@ ansible-playbook -i inventory-02.ini proxmox-cloudimg.yml \
   -e vm_memory=1024 \
   -e vm_cores=1 \
   -e vm_disk_size=16G
+
+
+ansible-playbook -i inventory.ini vault-setup.yaml
+
+
+ansible-playbook -i inventory.ini vault-setup.yaml --tags install
+
+ansible-playbook -i inventory.ini vault-setup.yaml --tags install,configure
+
+
+# Only initialization and unsealing
+ansible-playbook -i inventory.ini vault-setup.yaml --tags init,unseal
+
+
+ansible -i inventory.ini vault_nodes -b -m shell -a "systemctl status vault --no-pager -l"
+
+
