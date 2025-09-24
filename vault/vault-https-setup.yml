@@ -1,0 +1,367 @@
+---
+- name: Setup HTTPS certificates and configure Vault for HTTPS mode
+  hosts: vault_nodes
+  become: yes
+  vars:
+    vault_user: "vault"
+    vault_group: "vault"
+    vault_config_dir: "/etc/vault.d"
+    vault_certs_dir: "/opt/vault/tls"
+    vault_service_name: "vault"
+
+    # PKI Configuration
+    pki_mount_path: "pki"
+    pki_role_name: "vault-server"
+
+    # Certificate configuration
+    cert_alt_names:
+      - "vault-01.local"
+      - "vault-02.local"
+      - "vault-03.local"
+      - "localhost"
+    cert_ip_sans:
+      - "127.0.0.1"
+      - "10.0.2.41"
+      - "10.0.2.42"
+      - "10.0.2.43"
+
+    # Vault configuration
+    vault_port: 8200
+    vault_cluster_port: 8201
+
+    # PostgreSQL backend configuration
+    vault_db_host: "10.0.2.20"
+    vault_db_port: 5433
+    vault_db_name: "vault"
+    vault_db_user: "vault_admin"
+    vault_db_password: "vault_admin_123"
+    vault_table: "vault_kv_store"
+
+  tasks:
+    # Step 1: Setup certificates directory
+    - name: "STEP 1: Create TLS certificates directory"
+      file:
+        path: "{{ vault_certs_dir }}"
+        state: directory
+        owner: "{{ vault_user }}"
+        group: "{{ vault_group }}"
+        mode: '0755'
+      tags: ['step1', 'setup-dirs']
+
+    # Step 2: Check Vault status for certificate generation
+    - name: "STEP 2: Check if Vault is running and unsealed (for cert generation)"
+      uri:
+        url: "http://{{ hostvars[groups['vault_nodes'][0]]['ansible_host'] }}:{{ vault_port }}/v1/sys/seal-status"
+        method: GET
+      register: vault_status
+      failed_when: false
+      delegate_to: "{{ groups['vault_nodes'][0] }}"
+      run_once: true
+      tags: ['step2', 'check-vault']
+
+    - name: "STEP 2: Set vault status facts for all nodes"
+      set_fact:
+        vault_status_shared: "{{ hostvars[groups['vault_nodes'][0]]['vault_status'] }}"
+      tags: ['step2', 'check-vault']
+
+    - name: "STEP 2: Display Vault status"
+      debug:
+        msg: |
+          Vault status check results:
+          - HTTP Status: {{ vault_status_shared.status | default('unknown') }}
+          - Vault Sealed: {{ vault_status_shared.json.sealed | default('unknown') }}
+          - Available: {{ vault_status_shared.status == 200 }}
+          - Response: {{ vault_status_shared.json | default('No JSON response') }}
+      tags: ['step2', 'check-vault']
+
+
+    # Step 2.5: Setup PKI infrastructure if not exists
+    - name: "STEP 2.5: Check Vault status for PKI setup"
+      uri:
+        url: "http://{{ hostvars[groups['vault_nodes'][0]]['ansible_host'] }}:{{ vault_port }}/v1/sys/seal-status"
+        method: GET
+      register: vault_status_pki
+      failed_when: false
+      delegate_to: "{{ groups['vault_nodes'][0] }}"
+      run_once: true
+      tags: ['step2.5', 'setup-pki']
+
+    - name: "STEP 2.5: Set PKI setup conditions"
+      set_fact:
+        vault_accessible_pki: "{{ vault_status_pki.json is defined }}"
+        vault_unsealed_pki: "{{ vault_status_pki.json is defined and not vault_status_pki.json.sealed }}"
+        token_provided_pki: "{{ vault_root_token is defined and vault_root_token != 'SET_YOUR_ROOT_TOKEN_HERE' }}"
+        can_setup_pki: "{{ (vault_status_pki.json is defined and not vault_status_pki.json.sealed) and (vault_root_token is defined and vault_root_token != 'SET_YOUR_ROOT_TOKEN_HERE') }}"
+      tags: ['step2.5', 'setup-pki']
+
+    - name: "STEP 2.5: Check if PKI mount exists"
+      uri:
+        url: "http://{{ hostvars[groups['vault_nodes'][0]]['ansible_host'] }}:{{ vault_port }}/v1/sys/mounts"
+        method: GET
+        headers:
+          X-Vault-Token: "{{ vault_root_token }}"
+      register: mounts_check
+      failed_when: false
+      delegate_to: "{{ groups['vault_nodes'][0] }}"
+      run_once: true
+      when: can_setup_pki | bool
+      tags: ['step2.5', 'setup-pki']
+
+    - name: "STEP 2.5: Enable PKI secrets engine"
+      uri:
+        url: "http://{{ hostvars[groups['vault_nodes'][0]]['ansible_host'] }}:{{ vault_port }}/v1/sys/mounts/{{ pki_mount_path }}"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ vault_root_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          type: "pki"
+          description: "PKI engine for SSL certificates"
+          config:
+            max_lease_ttl: "87600h"  # 10 years
+      register: pki_mount_result
+      failed_when: false
+      delegate_to: "{{ groups['vault_nodes'][0] }}"
+      run_once: true
+      when:
+        - can_setup_pki | bool
+        - mounts_check.json is defined
+        - pki_mount_path + "/" not in mounts_check.json.data.keys()
+      tags: ['step2.5', 'setup-pki']
+
+    - name: "STEP 2.5: Generate root CA certificate"
+      uri:
+        url: "http://{{ hostvars[groups['vault_nodes'][0]]['ansible_host'] }}:{{ vault_port }}/v1/{{ pki_mount_path }}/root/generate/internal"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ vault_root_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          common_name: "Vault Root CA"
+          ttl: "87600h"  # 10 years
+      register: root_ca_result
+      failed_when: false
+      delegate_to: "{{ groups['vault_nodes'][0] }}"
+      run_once: true
+      when: can_setup_pki | bool
+      tags: ['step2.5', 'setup-pki']
+
+    - name: "STEP 2.5: Create PKI role for vault servers"
+      uri:
+        url: "http://{{ hostvars[groups['vault_nodes'][0]]['ansible_host'] }}:{{ vault_port }}/v1/{{ pki_mount_path }}/roles/{{ pki_role_name }}"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ vault_root_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          allowed_domains: "local,localhost"
+          allow_subdomains: true
+          allow_localhost: true
+          allow_ip_sans: true
+          allowed_ip_sans: "127.0.0.1,10.0.2.41,10.0.2.42,10.0.2.43"
+          key_bits: 2048
+          key_type: "rsa"
+          ttl: "87600h"  # 10 year
+          max_ttl: "87600h"
+      register: pki_role_result
+      failed_when: false
+      delegate_to: "{{ groups['vault_nodes'][0] }}"
+      run_once: true
+      when: can_setup_pki | bool
+      tags: ['step2.5', 'setup-pki']
+
+    - name: "STEP 2.5: Display PKI setup status"
+      debug:
+        msg: |
+          PKI Infrastructure Setup Results:
+          {% if can_setup_pki %}
+          - PKI Mount: {{ 'Success' if pki_mount_result.status|default(0) in [200, 204] else 'Failed/Already exists' }}
+          - Root CA: {{ 'Generated' if root_ca_result.status|default(0) == 200 else 'Failed/Already exists' }}
+          - PKI Role: {{ 'Created' if pki_role_result.status|default(0) in [200, 204] else 'Failed/Already exists' }}
+          {% else %}
+          ❌ FAILED - Cannot setup PKI:
+          - Vault accessible: {{ vault_accessible_pki }}
+          - Vault unsealed: {{ vault_unsealed_pki }}
+          - Token provided: {{ token_provided_pki }}
+          {% endif %}
+      run_once: true
+      tags: ['step2.5', 'setup-pki']
+
+
+    # Step 3: Check Vault status directly (when running step 3 alone)
+    - name: "STEP 3: Check Vault status directly for certificate generation"
+      uri:
+        url: "http://{{ hostvars[groups['vault_nodes'][0]]['ansible_host'] }}:{{ vault_port }}/v1/sys/seal-status"
+        method: GET
+      register: vault_status_direct
+      failed_when: false
+      delegate_to: "{{ groups['vault_nodes'][0] }}"
+      run_once: true
+      when: vault_status_shared is not defined
+      tags: ['step3', 'generate-certs']
+
+    - name: "STEP 3: Set vault status facts for all nodes"
+      set_fact:
+        vault_status_shared: "{{ vault_status_direct if vault_status_direct is defined else hostvars[groups['vault_nodes'][0]]['vault_status'] }}"
+      tags: ['step3', 'generate-certs']
+
+    - name: "STEP 3: Set certificate generation conditions for all nodes"
+      set_fact:
+        vault_accessible: "{{ vault_status_shared.json is defined }}"
+        vault_unsealed: "{{ vault_status_shared.json is defined and not vault_status_shared.json.sealed }}"
+        token_provided: "{{ vault_root_token is defined and vault_root_token != 'SET_YOUR_ROOT_TOKEN_HERE' }}"
+        can_generate_certs: "{{ (vault_status_shared.json is defined and not vault_status_shared.json.sealed) and (vault_root_token is defined and vault_root_token != 'SET_YOUR_ROOT_TOKEN_HERE') }}"
+      tags: ['step3', 'generate-certs']
+
+    # Step 3: Generate certificates using Vault PKI
+    - name: "STEP 3: Generate certificate for {{ inventory_hostname }} using Vault PKI"
+      uri:
+        url: "http://{{ hostvars[groups['vault_nodes'][0]]['ansible_host'] }}:{{ vault_port }}/v1/{{ pki_mount_path }}/issue/{{ pki_role_name }}"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ vault_root_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          common_name: "{{ inventory_hostname }}.local"
+          alt_names: "{{ cert_alt_names | join(',') }}"
+          ip_sans: "{{ cert_ip_sans | join(',') }}"
+          display_name: "{{ inventory_hostname }}-vault-server-cert"
+          ttl: "87600h"  # 10 year
+      register: cert_response
+      become: no
+      when: can_generate_certs | bool
+      tags: ['step3', 'generate-certs']
+
+    - name: "STEP 3: Save certificate to file"
+      copy:
+        content: "{{ cert_response.json.data.certificate }}"
+        dest: "{{ vault_certs_dir }}/vault-cert.pem"
+        owner: "{{ vault_user }}"
+        group: "{{ vault_group }}"
+        mode: '0644'
+      when: cert_response is defined and cert_response.json is defined
+      tags: ['step3', 'generate-certs']
+
+    - name: "STEP 3: Save private key to file"
+      copy:
+        content: "{{ cert_response.json.data.private_key }}"
+        dest: "{{ vault_certs_dir }}/vault-key.pem"
+        owner: "{{ vault_user }}"
+        group: "{{ vault_group }}"
+        mode: '0600'
+      when: cert_response is defined and cert_response.json is defined
+      tags: ['step3', 'generate-certs']
+
+    - name: "STEP 3: Save CA certificate to file"
+      copy:
+        content: "{{ cert_response.json.data.issuing_ca }}"
+        dest: "{{ vault_certs_dir }}/vault-ca.pem"
+        owner: "{{ vault_user }}"
+        group: "{{ vault_group }}"
+        mode: '0644'
+      when: cert_response is defined and cert_response.json is defined
+      tags: ['step3', 'generate-certs']
+
+    - name: "STEP 3: Display certificate generation status"
+      debug:
+        msg: |
+          Certificate generation status for {{ inventory_hostname }}:
+          {% if cert_response is defined and cert_response.json is defined %}
+          ✅ SUCCESS - Certificate generated and saved
+          {% elif not vault_accessible %}
+          ❌ FAILED - Vault is not accessible (HTTP Status: {{ vault_status_shared.status | default('unknown') }})
+          {% elif not vault_unsealed %}
+          ❌ FAILED - Vault is sealed, cannot generate certificates
+          {% elif not token_provided %}
+          ❌ FAILED - Root token not provided or invalid
+          {% else %}
+          ❌ FAILED - Unknown error during certificate generation
+          {% endif %}
+          
+          Debug info:
+          - Vault accessible: {{ vault_accessible }}
+          - Vault unsealed: {{ vault_unsealed }}
+          - Token provided: {{ token_provided }}
+          - Can generate certs: {{ can_generate_certs }}
+          - Vault HTTP status: {{ vault_status_shared.status | default('unknown') }}
+          - Vault sealed status: {{ vault_status_shared.json.sealed | default('unknown') }}
+      tags: ['step3', 'generate-certs']
+
+
+
+
+    # Step 4: Create Vault HTTPS configuration using template
+    - name: "STEP 4: Create Vault HTTPS configuration from template"
+      template:
+        src: vault-https-config.hcl.j2
+        dest: "{{ vault_config_dir }}/vault.hcl"
+        owner: "{{ vault_user }}"
+        group: "{{ vault_group }}"
+        mode: '0640'
+        backup: yes
+      notify: restart vault
+      tags: ['step4', 'configure-vault']
+
+    # Step 5: Stop Vault service
+    - name: "STEP 5: Stop Vault service before configuration change"
+      systemd:
+        name: "{{ vault_service_name }}"
+        state: stopped
+      when: ansible_service_mgr == "systemd"
+      tags: ['step5', 'restart-services']
+
+    # Step 6: Start Vault service with HTTPS
+    - name: "STEP 6: Start Vault service with new HTTPS configuration"
+      systemd:
+        name: "{{ vault_service_name }}"
+        state: started
+        enabled: yes
+        daemon_reload: yes
+      when: ansible_service_mgr == "systemd"
+      tags: ['step6', 'restart-services']
+
+    # Step 7: Wait and verify HTTPS
+    - name: "STEP 7: Wait for Vault to start on HTTPS"
+      wait_for:
+        port: "{{ vault_port }}"
+        host: "{{ ansible_host }}"
+        delay: 10
+        timeout: 60
+      tags: ['step7', 'verify-https']
+
+    - name: "STEP 7: Check Vault HTTPS status"
+      uri:
+        url: "https://{{ ansible_host }}:{{ vault_port }}/v1/sys/seal-status"
+        method: GET
+        validate_certs: no
+      register: https_status
+      retries: 3
+      delay: 5
+      failed_when: false
+      tags: ['step7', 'verify-https']
+
+    - name: "STEP 7: Display Vault HTTPS status"
+      debug:
+        msg: |
+          🔐 Vault {{ inventory_hostname }} HTTPS Status:
+          {% if https_status.json is defined %}
+          - Accessible via HTTPS: ✅
+          - Sealed: {{ https_status.json.sealed | default('unknown') }}
+          - Cluster Name: {{ https_status.json.cluster_name | default('N/A') }}
+          - HTTPS URL: https://{{ ansible_host }}:{{ vault_port }}
+          {% else %}
+          - Accessible via HTTPS: ❌ (Status: {{ https_status.status | default('unknown') }})
+          {% endif %}
+      tags: ['step7', 'verify-https']
+
+  handlers:
+    - name: restart vault
+      systemd:
+        name: "{{ vault_service_name }}"
+        state: restarted
+        daemon_reload: yes
+      when: ansible_service_mgr == "systemd"

@@ -188,13 +188,13 @@
       register: vault_init_status
       delegate_to: "{{ groups['vault_nodes'][0] }}"
       run_once: true
-      tags: [ 'init' ]
+      tags: [ 'init' , 'unseal']
 
     - name: Set initialization status fact
       set_fact:
         vault_is_initialized: "{{ vault_init_status.json.initialized }}"
       run_once: true
-      tags: [ 'init' ]
+      tags: [ 'init', 'unseal' ]
 
     # Check if unseal keys already exist in database
     - name: Check for existing unseal keys in database
@@ -210,34 +210,38 @@
       become: no
       run_once: true
       when: vault_is_initialized
-      tags: [ 'init' ]
+      tags: [ 'init', 'unseal' ]
 
     - name: Set unseal keys from database
       set_fact:
         vault_unseal_keys: "{{ existing_unseal_keys.query_result | map(attribute='key') | list }}"
       run_once: true
       when: vault_is_initialized and existing_unseal_keys.query_result is defined and existing_unseal_keys.query_result | length > 0
-      tags: [ 'init' ]
+      tags: [ 'init' , 'unseal']
 
     # Initialize Vault if not already initialized
     - name: Initialize Vault (leader only)
-      command: vault operator init -key-shares=5 -key-threshold=3 -format=json
-      environment:
-        VAULT_ADDR: "http://127.0.0.1:{{ vault_api_port }}"
+      uri:
+        url: "http://{{ ansible_host }}:{{ vault_api_port }}/v1/sys/init"
+        method: POST
+        body_format: json
+        body:
+          secret_shares: 5
+          secret_threshold: 3
+        status_code: [ 200 ]
       when:
         - inventory_hostname == groups['vault_nodes'][0]
         - not vault_is_initialized
-      register: vault_init_output
+      register: vault_init_result
       tags: [ 'init' ]
 
-    - name: Parse initialization output
+    - name: Set initialization facts from API response
       set_fact:
-        vault_init_data: "{{ vault_init_output.stdout | from_json }}"
-        vault_unseal_keys: "{{ (vault_init_output.stdout | from_json).unseal_keys_b64 }}"
-        vault_root_token: "{{ (vault_init_output.stdout | from_json).root_token }}"
+        vault_unseal_keys: "{{ vault_init_result.json.keys_base64 }}"
+        vault_root_token: "{{ vault_init_result.json.root_token }}"
       when:
-        - vault_init_output is defined
-        - vault_init_output.stdout is defined
+        - vault_init_result is defined
+        - vault_init_result.json is defined
         - inventory_hostname == groups['vault_nodes'][0]
       run_once: true
       tags: [ 'init' ]
@@ -245,13 +249,12 @@
     - name: Save unseal keys to database
       postgresql_query:
         db: "{{ vault_db_name }}"
-        query: >
-          INSERT INTO {{ vault_unseal_table }} (key)
-          VALUES {{ vault_unseal_keys | map('regex_replace', '^(.*)$', "('\\1')") | join(', ') }};
+        query: "INSERT INTO {{ vault_unseal_table }} (key) VALUES ('{{ item }}');"
         login_host: "{{ vault_db_host }}"
         login_user: "{{ postgres_admin_user }}"
         login_password: "{{ postgres_admin_password }}"
         port: "{{ vault_db_port }}"
+      loop: "{{ vault_unseal_keys }}"
       delegate_to: "{{ groups['postgres_host'][0] }}"
       become: no
       when:
@@ -261,12 +264,10 @@
       run_once: true
       tags: [ 'init' ]
 
-    - name: Save root token to database (as a separate entry)
+    - name: Save root token to database
       postgresql_query:
         db: "{{ vault_db_name }}"
-        query: >
-          INSERT INTO {{ vault_unseal_table }} (key)
-          VALUES ('ROOT_TOKEN:{{ vault_root_token }}');
+        query: "INSERT INTO {{ vault_unseal_table }} (key) VALUES ('ROOT_TOKEN:{{ vault_root_token }}');"
         login_host: "{{ vault_db_host }}"
         login_user: "{{ postgres_admin_user }}"
         login_password: "{{ postgres_admin_password }}"

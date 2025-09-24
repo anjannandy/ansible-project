@@ -1,0 +1,43 @@
+
+- name: Optimize PostgreSQL for Vault cluster
+  hosts: postgres_cluster
+  become: yes
+  tasks:
+    - name: Find PostgreSQL configuration files
+      find:
+        paths: "/etc/postgresql"
+        patterns: "postgresql.conf"
+        recurse: yes
+      register: pg_config_files
+
+    - name: Update PostgreSQL connection settings
+      lineinfile:
+        path: "{{ pg_config_files.files[0].path }}"
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        backup: yes
+      loop:
+        - { regexp: '^#?max_connections', line: 'max_connections = 300' }
+        - { regexp: '^#?shared_buffers', line: 'shared_buffers = 512MB' }
+        - { regexp: '^#?effective_cache_size', line: 'effective_cache_size = 1GB' }
+        - { regexp: '^#?maintenance_work_mem', line: 'maintenance_work_mem = 128MB' }
+        - { regexp: '^#?checkpoint_completion_target', line: 'checkpoint_completion_target = 0.9' }
+        - { regexp: '^#?wal_buffers', line: 'wal_buffers = 32MB' }
+        - { regexp: '^#?tcp_keepalives_idle', line: 'tcp_keepalives_idle = 300' }
+        - { regexp: '^#?tcp_keepalives_interval', line: 'tcp_keepalives_interval = 10' }
+        - { regexp: '^#?tcp_keepalives_count', line: 'tcp_keepalives_count = 3' }
+        - { regexp: '^#?statement_timeout', line: 'statement_timeout = 60000' }
+        - { regexp: '^#?lock_timeout', line: 'lock_timeout = 30000' }
+        - { regexp: '^#?idle_in_transaction_session_timeout', line: 'idle_in_transaction_session_timeout = 60000' }
+
+    - name: Restart PostgreSQL
+      systemd:
+        name: postgresql
+        state: restarted
+
+    - name: Wait for PostgreSQL to be ready
+      wait_for:
+        port: 5432
+        host: "127.0.0.1"
+        delay: 10
+        timeout: 60

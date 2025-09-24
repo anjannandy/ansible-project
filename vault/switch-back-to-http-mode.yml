@@ -1,0 +1,82 @@
+
+---
+- name: Switch Vault back to HTTP on all nodes
+  hosts: vault_nodes
+  become: yes
+  vars:
+    vault_config_path: "/etc/vault.d"
+    vault_db_host: "10.0.2.20"
+    vault_db_port: 5433
+    vault_db_name: "vault"
+    vault_db_user: "vault_admin"
+    vault_db_password: "vault_admin_123"
+    vault_table: "vault_kv_store"
+    vault_api_port: 8200
+    vault_cluster_port: 8201
+
+  tasks:
+    - name: Stop Vault service
+      systemd:
+        name: vault
+        state: stopped
+      ignore_errors: yes
+
+    - name: Configure Vault for HTTP (disable TLS)
+      copy:
+        dest: "{{ vault_config_path }}/vault.hcl"
+        owner: vault
+        group: vault
+        mode: '0640'
+        content: |
+          storage "postgresql" {
+            connection_url = "postgresql://{{ vault_db_user }}:{{ vault_db_password }}@{{ vault_db_host }}:{{ vault_db_port }}/{{ vault_db_name }}?sslmode=disable"
+            table          = "{{ vault_table }}"
+          }
+
+          listener "tcp" {
+            address     = "0.0.0.0:{{ vault_api_port }}"
+            tls_disable = 1
+          }
+
+          api_addr     = "http://{{ ansible_host }}:{{ vault_api_port }}"
+          cluster_addr = "http://{{ ansible_host }}:{{ vault_cluster_port }}"
+          cluster_name = "vault-cluster"
+          ui           = true
+          
+          log_level = "INFO"
+          log_format = "standard"
+          
+          # Disable mlock for testing
+          disable_mlock = true
+
+    - name: Start Vault service
+      systemd:
+        name: vault
+        state: started
+
+    - name: Wait for Vault to be ready
+      wait_for:
+        port: "{{ vault_api_port }}"
+        host: "{{ ansible_host }}"
+        delay: 10
+        timeout: 60
+
+    - name: Test Vault HTTP connectivity
+      uri:
+        url: "http://{{ ansible_host }}:{{ vault_api_port }}/v1/sys/health"
+        method: GET
+        status_code: [200, 429, 472, 501, 503]
+      register: vault_health
+
+    - name: Show Vault status
+      debug:
+        msg: "{{ inventory_hostname }} - HTTP Status: {{ vault_health.status }}"
+
+    - name: Run auto-unseal script
+      command: /usr/local/bin/vault-auto-unseal.sh
+      register: unseal_result
+      ignore_errors: yes
+
+    - name: Show unseal status
+      debug:
+        msg: "{{ inventory_hostname }} - Unseal result: {{ unseal_result.rc }}"

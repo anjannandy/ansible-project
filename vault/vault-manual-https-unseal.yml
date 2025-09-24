@@ -1,0 +1,32 @@
+- name: Working Manual Vault Unseal
+  hosts: vault_nodes
+  become: no
+  serial: 1
+  vars:
+    vault_api_port: 8200
+
+  tasks:
+    - name: Manual unseal with working delays
+      shell: |
+        curl -s -X POST -H 'Content-Type: application/json' -d '{"key": "TOKEN1"}' --insecure https://{{ ansible_host }}:{{ vault_api_port }}/v1/sys/unseal | jq &&
+        sleep 10 &&
+        curl -s -X POST -H 'Content-Type: application/json' -d '{"key": "TOKEN2"}' --insecure https://{{ ansible_host }}:{{ vault_api_port }}/v1/sys/unseal | jq &&
+        sleep 15 &&
+        curl -s -X POST -H 'Content-Type: application/json' -d '{"key": "TOKEN3"}' --insecure https://{{ ansible_host }}:{{ vault_api_port }}/v1/sys/unseal | jq
+      register: unseal_result
+
+    - name: Show unseal results
+      debug:
+        msg: "{{ unseal_result.stdout_lines }}"
+
+    - name: Final status check
+      uri:
+        url: "https://{{ ansible_host }}:{{ vault_api_port }}/v1/sys/seal-status"
+        method: GET
+        validate_certs: no
+
+      register: final_status
+
+    - name: Display final result
+      debug:
+        msg: "{{ inventory_hostname }} - Final: Sealed={{ final_status.json.sealed }}, Progress={{ final_status.json.progress }}/{{ final_status.json.t }}"

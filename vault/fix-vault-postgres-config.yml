@@ -1,0 +1,62 @@
+- name: Update Vault PostgreSQL configuration
+  hosts: vault_nodes
+  become: yes
+  vars:
+    vault_config_path: "/etc/vault.d"
+    vault_db_host: "10.0.2.20"
+    vault_db_port: 5433
+    vault_db_name: "vault"
+    vault_db_user: "vault_admin"
+    vault_db_password: "vault_admin_123"
+    vault_table: "vault_kv_store"
+    vault_api_port: 8200
+    vault_cluster_port: 8201
+
+  tasks:
+    - name: Update Vault configuration with optimized PostgreSQL settings
+      copy:
+        dest: "{{ vault_config_path }}/vault.hcl"
+        owner: vault
+        group: vault
+        mode: '0640'
+        content: |
+          storage "postgresql" {
+            connection_url = "postgresql://{{ vault_db_user }}:{{ vault_db_password }}@{{ vault_db_host }}:{{ vault_db_port }}/{{ vault_db_name }}?sslmode=disable&connect_timeout=10&statement_timeout=30000&idle_in_transaction_session_timeout=60000"
+            table          = "{{ vault_table }}"
+            max_parallel   = 128
+          }
+
+          listener "tcp" {
+            address     = "0.0.0.0:{{ vault_api_port }}"
+            tls_disable = 1
+          }
+
+          api_addr     = "http://{{ ansible_host }}:{{ vault_api_port }}"
+          cluster_addr = "http://{{ ansible_host }}:{{ vault_cluster_port }}"
+          cluster_name = "vault-cluster"
+          ui           = true
+          
+          log_level = "INFO"
+          log_format = "standard"
+          
+          # Disable mlock for testing
+          disable_mlock = true
+      notify: restart vault
+
+    - name: Restart Vault service
+      systemd:
+        name: vault
+        state: restarted
+
+    - name: Wait for Vault to be ready
+      wait_for:
+        port: "{{ vault_api_port }}"
+        host: "{{ ansible_host }}"
+        delay: 10
+        timeout: 60
+
+  handlers:
+    - name: restart vault
+      systemd:
+        name: vault
+        state: restarted
