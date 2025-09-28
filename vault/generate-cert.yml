@@ -1,0 +1,380 @@
+---
+- name: Generate certificates for specified hostname and IP (HTTPS Vault)
+  hosts: localhost
+  connection: local
+  gather_facts: yes
+  vars:
+    # Parse comma-separated inputs into lists
+    target_hostnames: "{{ cert_hostname.split(',') | map('trim') | list if cert_hostname is defined else ['example.local'] }}"
+    target_ip_addresses: "{{ cert_ip.split(',') | map('trim') | list if cert_ip is defined else ['192.168.1.100'] }}"
+    local_cert_directory: "{{ cert_output_dir | default('./generated-certs') }}"
+    
+    # Vault connection - NOW USING HTTPS
+    vault_host: "{{ vault_server_host | default('10.0.2.40') }}"
+    vault_port: "{{ vault_server_port | default('8200') }}"
+    vault_base_url: "https://{{ vault_host }}:{{ vault_port }}"
+    
+    # PKI Configuration
+    pki_intermediate_mount_path: "pki-intermediate"
+    pki_role_name: "vault-server"
+
+  tasks:
+    - name: "Validate required variables"
+      fail:
+        msg: |
+          Missing required variables. Please provide:
+          - cert_hostname: Comma-separated hostnames (e.g., "server1.local,server2.local")
+          - cert_ip: Comma-separated IP addresses (e.g., "10.0.0.1,10.0.0.2")
+          - cert_output_dir: Local directory to store certificates
+          - vault_root_token: Vault root token for authentication
+          
+          Example:
+          ansible-playbook generate-cert-https.yml \
+            -e cert_hostname="server01.homelab.com,server02.homelab.com" \
+            -e cert_ip="10.0.0.4,10.0.0.5" \
+            -e cert_output_dir="./proxmox-certs" \
+            -e vault_root_token="hvs.Z9X5FA2dEhbh2A0VYGlyMiB5"
+      when: >
+        vault_root_token is not defined or 
+        cert_hostname is not defined or
+        cert_ip is not defined or
+        cert_output_dir is not defined
+      tags: ['validate']
+
+    - name: "Display parsed inputs"
+      debug:
+        msg: |
+          Certificate generation configuration:
+          - Hostnames: {{ target_hostnames }}
+          - IP Addresses: {{ target_ip_addresses }}
+          - Output Directory: {{ local_cert_directory }}
+          - Vault HTTPS URL: {{ vault_base_url }}
+          - PKI Mount: {{ pki_intermediate_mount_path }}
+          - PKI Role: {{ pki_role_name }}
+      tags: ['validate']
+
+    - name: "Create local certificate directory"
+      file:
+        path: "{{ local_cert_directory }}"
+        state: directory
+        mode: '0755'
+      tags: ['setup']
+
+    - name: "Check Vault HTTPS status"
+      uri:
+        url: "{{ vault_base_url }}/v1/sys/seal-status"
+        method: GET
+        timeout: 10
+        validate_certs: no  # Use --insecure equivalent
+      register: vault_status_check
+      failed_when: false
+      tags: ['check-vault']
+
+    - name: "Display Vault status check"
+      debug:
+        msg: |
+          Vault HTTPS Status Check:
+          - URL: {{ vault_base_url }}/v1/sys/seal-status
+          - HTTP Status: {{ vault_status_check.status | default('Connection failed') }}
+          - Response: {{ vault_status_check.json | default('No JSON response') }}
+          - Sealed: {{ vault_status_check.json.sealed | default('unknown') if vault_status_check.json is defined else 'unknown' }}
+      tags: ['check-vault']
+
+    - name: "Validate Vault accessibility"
+      fail:
+        msg: |
+          Vault validation failed:
+          - Vault HTTPS URL: {{ vault_base_url }}
+          - Status: {{ vault_status_check.status | default('Connection failed') }}
+          - Sealed: {{ vault_status_check.json.sealed | default('unknown') if vault_status_check.json is defined else 'unknown' }}
+          - Response: {{ vault_status_check.json | default('No response') }}
+          
+          Troubleshooting:
+          1. Verify Vault is running: curl -k {{ vault_base_url }}/v1/sys/health
+          2. Check if Vault is unsealed
+          3. Verify the HTTPS certificate is working
+      when: >
+        vault_status_check.status is not defined or
+        vault_status_check.status != 200 or
+        (vault_status_check.json is defined and vault_status_check.json.sealed | default(true))
+      tags: ['check-vault']
+
+    - name: "Check if PKI intermediate mount exists"
+      uri:
+        url: "{{ vault_base_url }}/v1/sys/mounts"
+        method: GET
+        headers:
+          X-Vault-Token: "{{ vault_root_token }}"
+        validate_certs: no
+      register: mounts_check
+      failed_when: false
+      tags: ['check-pki']
+
+    - name: "Display PKI mount check"
+      debug:
+        msg: |
+          PKI Mount Check:
+          - Status: {{ mounts_check.status | default('unknown') }}
+          - Available mounts: {{ mounts_check.json.data.keys() | list | join(', ') if mounts_check.json is defined and mounts_check.json.data is defined else 'Unable to retrieve' }}
+          - Looking for: {{ pki_intermediate_mount_path }}/
+          - Mount exists: {{ 'Yes' if mounts_check.json is defined and mounts_check.json.data is defined and pki_intermediate_mount_path + '/' in mounts_check.json.data.keys() else 'No' }}
+      tags: ['check-pki']
+
+    - name: "Check PKI role exists"
+      uri:
+        url: "{{ vault_base_url }}/v1/{{ pki_intermediate_mount_path }}/roles/{{ pki_role_name }}"
+        method: GET
+        headers:
+          X-Vault-Token: "{{ vault_root_token }}"
+        validate_certs: no
+      register: role_check
+      failed_when: false
+      tags: ['check-pki']
+
+    - name: "Update PKI role with comprehensive permissions"
+      uri:
+        url: "{{ vault_base_url }}/v1/{{ pki_intermediate_mount_path }}/roles/{{ pki_role_name }}"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ vault_root_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          # Very permissive settings for multi-domain certificates
+          allow_any_name: true
+          allow_ip_sans: true
+          allow_localhost: true
+          allowed_domains: "local,localhost,homelab.com,com"
+          allow_subdomains: true
+          enforce_hostnames: false
+          allow_wildcard_certificates: false
+          # Include all your IPs and common ranges
+          allowed_ip_sans: "127.0.0.1,{{ target_ip_addresses | join(',') }},10.0.0.0/8,192.168.0.0/16,172.16.0.0/12"
+          key_bits: 2048
+          key_type: "rsa"
+          ttl: "8760h"  # 1 year
+          max_ttl: "17520h"  # 2 years
+          generate_lease: true
+          no_store: false
+          require_cn: true
+          basic_constraints_valid_for_non_ca: true
+          client_flag: false
+          server_flag: true
+        validate_certs: no
+      register: role_update
+      failed_when: false
+      tags: ['setup-pki']
+
+    - name: "Display role update result"
+      debug:
+        msg: |
+          PKI Role Update:
+          - Status: {{ role_update.status | default('not attempted') }}
+          - Success: {{ 'Yes' if role_update.status in [200, 204] else 'No' }}
+          {% if role_update.status not in [200, 204] and role_update.json is defined %}
+          - Error: {{ role_update.json.errors | join(', ') if role_update.json.errors is defined else 'Unknown error' }}
+          {% endif %}
+      tags: ['setup-pki']
+
+    # Generate certificate with ALL hostnames and IPs in one certificate
+    - name: "Generate multi-domain certificate with all hostnames and IPs"
+      uri:
+        url: "{{ vault_base_url }}/v1/{{ pki_intermediate_mount_path }}/issue/{{ pki_role_name }}"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ vault_root_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          common_name: "{{ target_hostnames[0] }}"
+          alt_names: "{{ (target_hostnames + ['localhost']) | unique | join(',') }}"
+          ip_sans: "{{ (target_ip_addresses + ['127.0.0.1']) | unique | join(',') }}"
+          ttl: "8760h"
+          exclude_cn_from_sans: false
+        timeout: 30
+        validate_certs: no  # Skip certificate validation
+        return_content: yes  # Get full response content for debugging
+      register: multi_cert_response
+      failed_when: false
+      tags: ['generate']
+
+    - name: "Display detailed certificate generation result"
+      debug:
+        msg: |
+          Multi-Domain Certificate Generation:
+          ===================================
+          - Status: {{ multi_cert_response.status | default('unknown') }}
+          - Success: {{ 'Yes' if multi_cert_response.status == 200 else 'No' }}
+          
+          {% if multi_cert_response.status != 200 %}
+          Error Details:
+          - HTTP Status: {{ multi_cert_response.status }}
+          - Status Message: {{ multi_cert_response.msg | default('No message') }}
+          
+          {% if multi_cert_response.content is defined %}
+          - Response Content: {{ multi_cert_response.content }}
+          {% endif %}
+          
+          {% if multi_cert_response.json is defined %}
+          - JSON Response: {{ multi_cert_response.json }}
+          {% if multi_cert_response.json.errors is defined %}
+          - Specific Errors: {{ multi_cert_response.json.errors | join(', ') }}
+          {% endif %}
+          {% endif %}
+          
+          Request Details:
+          - URL: {{ vault_base_url }}/v1/{{ pki_intermediate_mount_path }}/issue/{{ pki_role_name }}
+          - Common Name: {{ target_hostnames[0] }}
+          - Alt Names: {{ (target_hostnames + ['localhost']) | unique | join(',') }}
+          - IP SANs: {{ (target_ip_addresses + ['127.0.0.1']) | unique | join(',') }}
+          
+          Troubleshooting:
+          1. Test manually: curl -k -X POST -H "X-Vault-Token: YOUR_TOKEN" {{ vault_base_url }}/v1/{{ pki_intermediate_mount_path }}/issue/{{ pki_role_name }}
+          2. Check PKI role permissions
+          3. Verify token has sufficient privileges
+          {% endif %}
+      tags: ['generate']
+
+    - name: "Save multi-domain certificate files"
+      copy:
+        content: "{{ item.content }}"
+        dest: "{{ local_cert_directory }}/{{ item.name }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { 
+            name: "multi-domain-cert.pem", 
+            content: "{{ multi_cert_response.json.data.certificate }}", 
+            mode: "0644" 
+          }
+        - { 
+            name: "multi-domain-key.pem", 
+            content: "{{ multi_cert_response.json.data.private_key }}", 
+            mode: "0600" 
+          }
+        - { 
+            name: "multi-domain-ca.pem", 
+            content: "{{ multi_cert_response.json.data.issuing_ca }}", 
+            mode: "0644" 
+          }
+      when: 
+        - multi_cert_response.status == 200
+        - multi_cert_response.json is defined
+        - multi_cert_response.json.data is defined
+      tags: ['save-files']
+
+    - name: "Create certificate bundle"
+      shell: |
+        cat {{ local_cert_directory }}/multi-domain-cert.pem \
+            {{ local_cert_directory }}/multi-domain-ca.pem \
+            > {{ local_cert_directory }}/multi-domain-bundle.pem
+      when: 
+        - multi_cert_response.status == 200
+        - multi_cert_response.json is defined
+      tags: ['save-files']
+
+    - name: "Generate certificate info file"
+      copy:
+        content: |
+          Multi-Domain Certificate Information
+          ===================================
+          Generated: {{ ansible_date_time.iso8601 }}
+          Serial Number: {{ multi_cert_response.json.data.serial_number | default('N/A') }}
+          
+          Certificate Details:
+          - Common Name: {{ target_hostnames[0] }}
+          - Alternative Names: {{ (target_hostnames + ['localhost']) | unique | join(', ') }}
+          - IP SANs: {{ (target_ip_addresses + ['127.0.0.1']) | unique | join(', ') }}
+          - TTL: 8760h (1 year)
+          - Key Type: RSA 2048-bit
+          - Issuer: Vault Intermediate CA
+          
+          Files Generated:
+          ================
+          - multi-domain-cert.pem    (Certificate)
+          - multi-domain-key.pem     (Private Key)
+          - multi-domain-ca.pem      (CA Certificate)
+          - multi-domain-bundle.pem  (Certificate + CA Bundle)
+          - multi-domain-info.txt    (This file)
+          
+          Manual Testing:
+          ==============
+          # Test certificate
+          openssl x509 -in multi-domain-cert.pem -text -noout
+          
+          # Verify certificate chain
+          openssl verify -CAfile multi-domain-ca.pem multi-domain-cert.pem
+          
+          Usage Examples:
+          ==============
+          # Copy to Proxmox servers
+          {% for hostname, ip in target_hostnames | zip(target_ip_addresses) %}
+          scp multi-domain-* root@{{ ip }}:/path/to/certs/  # {{ hostname }}
+          {% endfor %}
+          
+          # Apache Virtual Host
+          <VirtualHost *:443>
+              SSLCertificateFile /path/to/multi-domain-cert.pem
+              SSLCertificateKeyFile /path/to/multi-domain-key.pem
+              SSLCertificateChainFile /path/to/multi-domain-ca.pem
+          </VirtualHost>
+          
+          # Nginx Server Block  
+          server {
+              ssl_certificate /path/to/multi-domain-cert.pem;
+              ssl_certificate_key /path/to/multi-domain-key.pem;
+          }
+        dest: "{{ local_cert_directory }}/multi-domain-info.txt"
+        mode: '0644'
+      when: 
+        - multi_cert_response.status == 200
+        - multi_cert_response.json is defined
+      tags: ['save-files']
+
+    - name: "Display success message"
+      debug:
+        msg: |
+          🎉 Multi-Domain Certificate Generated Successfully!
+          =================================================
+          
+          📋 Certificate Details:
+          - Serial Number: {{ multi_cert_response.json.data.serial_number }}
+          - Common Name: {{ target_hostnames[0] }}
+          - Covers {{ target_hostnames | length }} hostname(s): {{ target_hostnames | join(', ') }}
+          - Covers {{ target_ip_addresses | length }} IP address(es): {{ target_ip_addresses | join(', ') }}
+          - Valid for: 1 year
+          
+          📁 Files saved to: {{ local_cert_directory }}
+          - multi-domain-cert.pem    (Certificate)
+          - multi-domain-key.pem     (Private Key)  
+          - multi-domain-ca.pem      (CA Certificate)
+          - multi-domain-bundle.pem  (Certificate + CA Bundle)
+          - multi-domain-info.txt    (Certificate Information)
+          
+          ✅ This single certificate can be used for ALL specified domains and IPs!
+          
+          🚀 Next Steps:
+          1. Copy certificates to your Proxmox servers
+          2. Configure your services to use the new certificates
+          3. Test HTTPS connectivity
+      when: 
+        - multi_cert_response.status == 200
+        - multi_cert_response.json is defined
+      tags: ['results']
+
+    - name: "Display failure summary"
+      debug:
+        msg: |
+          ❌ Certificate Generation Failed
+          ==============================
+          
+          Most likely causes:
+          1. Vault is sealed - run: curl -k {{ vault_base_url }}/v1/sys/seal-status
+          2. Invalid token - verify your root token is correct
+          3. PKI not configured - run the PKI setup first
+          4. Network/SSL issues - test: curl -k {{ vault_base_url }}/v1/sys/health
+          
+          See detailed error information above for specific troubleshooting steps.
+      when: 
+        - multi_cert_response is not defined or 
+          multi_cert_response.status != 200
+      tags: ['results']
