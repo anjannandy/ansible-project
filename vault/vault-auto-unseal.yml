@@ -8,8 +8,8 @@
     vault_db_port: 5433
     vault_db_name: "vault"
     vault_unseal_table: "vault_unseal_keys"
-    postgres_admin_user: "postgres"
-    postgres_admin_password: "postgres_password"
+    postgres_admin_user: "vault_admin"
+    postgres_admin_password: "vault_admin_123"
 
   tasks:
     - name: Create HTTPS-compatible auto-unseal script
