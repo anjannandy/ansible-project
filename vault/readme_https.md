@@ -5,13 +5,15 @@ ansible-playbook -i inventory.ini vault-db-setup.yml
 ansible-playbook -i inventory.ini vault-setup.yml
 
 ### **Step 3: Unseal All**
-ansible-playbook -i inventory.ini vault-manual-unseal.yml
+ansible-playbook -i inventory.ini vault-setup.yml --tags unseal
 
-### **Step 1: Setup directories only**
+### **Step 4: Setup directories only**
 ansible-playbook -i inventory.ini vault-https-setup.yml --tags step1
 
-### **Step 2: Check Vault status**
+### **Step 5: Check Vault status**
 ansible-playbook -i inventory.ini vault-https-setup.yml --tags step2
+
+ansible-playbook -i inventory.ini vault-https-setup.yml --tags step2.5 -e vault_root_token="YOUR_ROOT_TOKEN_HERE"
 
 ### **Step 3: Generate certificates (requires unsealed Vault)**
 ansible-playbook -i inventory.ini vault-https-setup.yml --tags step3 -e vault_root_token="YOUR_ROOT_TOKEN_HERE"

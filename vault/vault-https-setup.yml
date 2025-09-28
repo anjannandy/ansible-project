@@ -230,7 +230,7 @@
           alt_names: "{{ cert_alt_names | join(',') }}"
           ip_sans: "{{ cert_ip_sans | join(',') }}"
           display_name: "{{ inventory_hostname }}-vault-server-cert"
-          ttl: "87600h"  # 10 year
+          ttl: "8760h"  # 10 year
       register: cert_response
       become: no
       when: can_generate_certs | bool
