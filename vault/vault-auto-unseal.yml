@@ -5,7 +5,7 @@
   vars:
     vault_api_port: 8200
     vault_db_host: "10.0.2.20"
-    vault_db_port: 5433
+    vault_db_port: 5432
     vault_db_name: "vault"
     vault_unseal_table: "vault_unseal_keys"
     postgres_admin_user: "vault_admin"

@@ -8,8 +8,8 @@
     vault_schema: public
     vault_table: vault_kv_store
     vault_unseal_table: vault_unseal_keys
-    pg_port: 5433
-    pg_host: "127.0.0.1"
+    pg_port: 5432
+    pg_host: "localhost"
     pg_admin_user: "postgres"
     pg_admin_password: "postgres_password"
 

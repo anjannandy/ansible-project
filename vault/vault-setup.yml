@@ -7,7 +7,7 @@
     vault_cluster_port: 8201
     vault_config_path: "/etc/vault.d"
     vault_db_host: "10.0.2.20"
-    vault_db_port: 5433
+    vault_db_port: 5432
     vault_db_name: "vault"
     vault_db_user: "vault_admin"
     vault_db_password: "vault_admin_123"
