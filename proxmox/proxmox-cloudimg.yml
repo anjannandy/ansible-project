@@ -18,7 +18,7 @@
     disk_size: "{{ vm_disk_size | default('128G') }}"
 
     bridge: vmbr0
-    storage: local-lvm
+    storage: ceph-vmstore
     image_dir: /var/lib/vm-cloudimg
 
     # Ubuntu Noble cloud image (KVM-optimized)
@@ -33,7 +33,7 @@
     # Networking
     ipconfig0: "ip={{ vm_ip }}/{{ vm_netmask }},gw={{ vm_gateway }}"
     nameserver: "8.8.8.8"
-    searchdomain: "an.homelab.com"
+    searchdomain: "homelab.com"
 
   tasks:
     - name: Display VM configuration

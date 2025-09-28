@@ -1,0 +1,60 @@
+---
+- name: Update APT sources with Proxmox configurations
+  hosts: proxmox
+  become: yes
+  vars:
+    local_sources_dir: "proxmox/apt/sources.list.d"
+    remote_sources_dir: "/etc/apt/sources.list.d"
+
+  tasks:
+    - name: Find all existing source files in /etc/apt/sources.list.d
+      find:
+        paths: "{{ remote_sources_dir }}"
+        patterns: "*.sources,*.list"
+      register: existing_sources
+
+    - name: Remove all existing APT source files
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ existing_sources.files }}"
+      when: existing_sources.files is defined
+
+    - name: Find local Proxmox source files
+      find:
+        paths: "{{ local_sources_dir }}"
+        patterns: "*.sources,*.list"
+      delegate_to: localhost
+      register: local_sources
+      become: no
+
+    - name: Copy Proxmox source files to target hosts
+      copy:
+        src: "{{ item.path }}"
+        dest: "{{ remote_sources_dir }}/{{ item.path | basename }}"
+        owner: root
+        group: root
+        mode: '0644'
+        backup: yes
+      loop: "{{ local_sources.files }}"
+      when: local_sources.files is defined
+
+    - name: Update APT cache
+      apt:
+        update_cache: yes
+      register: apt_update_result
+
+    - name: Display APT update result
+      debug:
+        msg: "APT cache updated successfully"
+      when: apt_update_result is succeeded
+
+    - name: List final source files
+      find:
+        paths: "{{ remote_sources_dir }}"
+        patterns: "*.sources,*.list"
+      register: final_sources
+
+    - name: Show installed source files
+      debug:
+        msg: "Installed source files: {{ final_sources.files | map(attribute='path') | map('basename') | list }}"

@@ -1,4 +1,4 @@
-:q!Types: deb
+Types: deb
 URIs: http://download.proxmox.com/debian/ceph-squid
 Suites: trixie
 Components: no-subscription
