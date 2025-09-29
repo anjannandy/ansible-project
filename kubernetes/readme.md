@@ -40,7 +40,7 @@ ansible-playbook -i inventory/inventory.yml playbooks/pre-flight-checks.yml
 ansible-playbook -i inventory/inventory.yml playbooks/kubernetes-setup.yml
 
 # Check cluster status
-ssh kubeadmin@10.0.1.1
+ssh kubeadmin@10.0.1.0
 kubectl get nodes
 kubectl get pods -A
 ```
