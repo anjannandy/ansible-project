@@ -1,0 +1,219 @@
+
+---
+- name: Generate SSL Certificate for Keycloak Server
+  hosts: localhost
+  become: no
+  vars:
+    # Vault configuration
+    vault_host: "10.0.2.40"  # Adjust to your Vault server
+    vault_port: 8200
+    vault_scheme: "https"  # or "http" if Vault is not HTTPS yet
+
+    # PKI configuration
+    pki_intermediate_mount_path: "pki-intermediate"
+    pki_role_name: "vault-server"
+
+    # Certificate configuration
+    cert_ttl: "8760h"  # 1 year
+    cert_key_bits: 2048
+    cert_format: "pem"
+
+    # Default values (can be overridden)
+    cert_hostname: "keycloak-server.local"
+    cert_ip: "10.0.2.10"
+    cert_output_dir: "./keycloak-certs"
+
+    # Keycloak specific configuration
+    keycloak_cert_name: "keycloak"
+
+  tasks:
+    - name: Validate required parameters
+      fail:
+        msg: "vault_root_token is required"
+      when: vault_root_token is not defined or vault_root_token == ""
+
+    - name: Display certificate generation parameters
+      debug:
+        msg: |
+          🔐 Keycloak Certificate Generation Parameters:
+          - Hostname(s): {{ cert_hostname }}
+          - IP Address(es): {{ cert_ip }}
+          - Output Directory: {{ cert_output_dir }}
+          - Vault Server: {{ vault_scheme }}://{{ vault_host }}:{{ vault_port }}
+          - PKI Mount: {{ pki_intermediate_mount_path }}
+          - Role: {{ pki_role_name }}
+          - TTL: {{ cert_ttl }}
+
+    - name: Create output directory for certificates
+      file:
+        path: "{{ cert_output_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Check Vault status
+      uri:
+        url: "{{ vault_scheme }}://{{ vault_host }}:{{ vault_port }}/v1/sys/seal-status"
+        method: GET
+        validate_certs: no
+      register: vault_status
+      failed_when: false
+
+    - name: Validate Vault accessibility
+      fail:
+        msg: |
+          ❌ Cannot access Vault server:
+          - URL: {{ vault_scheme }}://{{ vault_host }}:{{ vault_port }}
+          - Status: {{ vault_status.status | default('unreachable') }}
+          - Sealed: {{ vault_status.json.sealed | default('unknown') if vault_status.json is defined else 'unknown' }}
+      when: vault_status.status != 200 or (vault_status.json is defined and vault_status.json.sealed)
+
+    - name: Generate certificate for Keycloak server
+      uri:
+        url: "{{ vault_scheme }}://{{ vault_host }}:{{ vault_port }}/v1/{{ pki_intermediate_mount_path }}/issue/{{ pki_role_name }}"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ vault_root_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          common_name: "{{ cert_hostname.split(',')[0] }}"
+          alt_names: "{{ cert_hostname }}"
+          ip_sans: "{{ cert_ip }}"
+          ttl: "{{ cert_ttl }}"
+          format: "{{ cert_format }}"
+          exclude_cn_from_sans: false
+        validate_certs: no
+      register: cert_response
+      failed_when: cert_response.status != 200
+
+    - name: Save Keycloak certificate to file
+      copy:
+        content: "{{ cert_response.json.data.certificate }}"
+        dest: "{{ cert_output_dir }}/{{ keycloak_cert_name }}.crt"
+        mode: '0644'
+
+    - name: Save Keycloak private key to file
+      copy:
+        content: "{{ cert_response.json.data.private_key }}"
+        dest: "{{ cert_output_dir }}/{{ keycloak_cert_name }}.key"
+        mode: '0600'
+
+    - name: Save CA certificate chain to file
+      copy:
+        content: "{{ cert_response.json.data.ca_chain | join('\n') }}"
+        dest: "{{ cert_output_dir }}/{{ keycloak_cert_name }}-ca-chain.crt"
+        mode: '0644'
+      when: cert_response.json.data.ca_chain is defined
+
+    - name: Save issuing CA certificate to file (fallback)
+      copy:
+        content: "{{ cert_response.json.data.issuing_ca }}"
+        dest: "{{ cert_output_dir }}/{{ keycloak_cert_name }}-ca.crt"
+        mode: '0644'
+      when: cert_response.json.data.ca_chain is not defined and cert_response.json.data.issuing_ca is defined
+
+    - name: Create combined certificate file (cert + CA chain)
+      shell: |
+        cat {{ cert_output_dir }}/{{ keycloak_cert_name }}.crt > {{ cert_output_dir }}/{{ keycloak_cert_name }}-fullchain.crt
+        {% if cert_response.json.data.ca_chain is defined %}
+        cat {{ cert_output_dir }}/{{ keycloak_cert_name }}-ca-chain.crt >> {{ cert_output_dir }}/{{ keycloak_cert_name }}-fullchain.crt
+        {% elif cert_response.json.data.issuing_ca is defined %}
+        cat {{ cert_output_dir }}/{{ keycloak_cert_name }}-ca.crt >> {{ cert_output_dir }}/{{ keycloak_cert_name }}-fullchain.crt
+        {% endif %}
+
+    - name: Create PKCS#12 keystore for Keycloak (optional)
+      shell: |
+        openssl pkcs12 -export \
+          -in {{ cert_output_dir }}/{{ keycloak_cert_name }}.crt \
+          -inkey {{ cert_output_dir }}/{{ keycloak_cert_name }}.key \
+          -out {{ cert_output_dir }}/{{ keycloak_cert_name }}.p12 \
+          -name "{{ keycloak_cert_name }}" \
+          -passout pass:changeit
+      when: create_keystore | default(false) | bool
+
+    - name: Store certificate metadata in Vault
+      uri:
+        url: "{{ vault_scheme }}://{{ vault_host }}:{{ vault_port }}/v1/secret/data/certificates/keycloak-server"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ vault_root_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          data:
+            service: "keycloak"
+            server_name: "keycloak-server"
+            certificate_serial: "{{ cert_response.json.data.serial_number }}"
+            common_name: "{{ cert_hostname.split(',')[0] }}"
+            alt_names: "{{ cert_hostname }}"
+            ip_sans: "{{ cert_ip }}"
+            issued_date: "{{ ansible_date_time.iso8601 }}"
+            expiry_date: "{{ cert_response.json.data.expiration | default('N/A') }}"
+            issuer: "Vault Intermediate CA"
+            purpose: "Keycloak Server HTTPS Certificate"
+            location: "{{ cert_output_dir }}"
+            ttl: "{{ cert_ttl }}"
+            key_bits: "{{ cert_key_bits }}"
+        validate_certs: no
+      register: metadata_result
+      failed_when: false
+
+    - name: Display certificate generation results
+      debug:
+        msg: |
+          ✅ Keycloak Certificate Generated Successfully!
+          
+          📋 Certificate Details:
+          - Serial Number: {{ cert_response.json.data.serial_number }}
+          - Common Name: {{ cert_hostname.split(',')[0] }}
+          - Alternative Names: {{ cert_hostname }}
+          - IP SANs: {{ cert_ip }}
+          - Valid Until: {{ cert_response.json.data.expiration | default('Check certificate file') }}
+          
+          📁 Generated Files:
+          - Certificate: {{ cert_output_dir }}/{{ keycloak_cert_name }}.crt
+          - Private Key: {{ cert_output_dir }}/{{ keycloak_cert_name }}.key
+          - CA Chain: {{ cert_output_dir }}/{{ keycloak_cert_name }}-ca-chain.crt
+          - Full Chain: {{ cert_output_dir }}/{{ keycloak_cert_name }}-fullchain.crt
+          {% if create_keystore | default(false) %}
+          - PKCS#12 Keystore: {{ cert_output_dir }}/{{ keycloak_cert_name }}.p12 (password: changeit)
+          {% endif %}
+          
+          🗃️  Metadata stored in Vault: {{ 'Success' if metadata_result.status|default(0) in [200, 204] else 'Failed' }}
+          
+          🚀 Next Steps:
+          1. Copy certificates to Keycloak server: scp {{ cert_output_dir }}/* user@10.0.2.10:/tmp/
+          2. Run Keycloak installation playbook
+          3. Configure Keycloak to use these certificates
+
+    - name: Create certificate installation commands
+      copy:
+        content: |
+          #!/bin/bash
+          # Keycloak Certificate Installation Commands
+          
+          # Copy certificates to Keycloak server
+          scp {{ cert_output_dir }}/{{ keycloak_cert_name }}.crt root@10.0.2.10:/opt/keycloak/conf/ssl/
+          scp {{ cert_output_dir }}/{{ keycloak_cert_name }}.key root@10.0.2.10:/opt/keycloak/conf/ssl/
+          scp {{ cert_output_dir }}/{{ keycloak_cert_name }}-ca.crt root@10.0.2.10:/opt/keycloak/conf/ssl/
+          
+          # Set proper permissions
+          ssh root@10.0.2.10 "chown keycloak:keycloak /opt/keycloak/conf/ssl/* && chmod 600 /opt/keycloak/conf/ssl/*.key && chmod 644 /opt/keycloak/conf/ssl/*.crt"
+          
+          # Restart Keycloak service
+          ssh root@10.0.2.10 "systemctl restart keycloak"
+        dest: "{{ cert_output_dir }}/install-keycloak-certs.sh"
+        mode: '0755'
+
+    - name: Verify certificate details
+      shell: |
+        echo "=== Certificate Information ==="
+        openssl x509 -in {{ cert_output_dir }}/{{ keycloak_cert_name }}.crt -text -noout | grep -E "(Subject:|DNS:|IP Address:|Not Before:|Not After:)"
+        echo ""
+        echo "=== Certificate Validation ==="
+        openssl x509 -in {{ cert_output_dir }}/{{ keycloak_cert_name }}.crt -noout -dates
+      register: cert_info
+
+    - name: Display certificate information
+      debug:
+        msg: "{{ cert_info.stdout }}"

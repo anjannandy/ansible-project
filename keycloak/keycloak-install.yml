@@ -1,0 +1,162 @@
+---
+- name: Setup Keycloak with PostgreSQL and SSL
+  hosts: keycloak-server
+  become: yes
+  vars:
+    keycloak_version: "22.0.5"
+    keycloak_user: "keycloak"
+    keycloak_group: "keycloak"
+    keycloak_home: "/opt/keycloak"
+    # VM/IP that will serve Keycloak
+    keycloak_hostname: "10.0.2.10"
+    # Path where pre-generated SSL certs exist (e.g., keycloak-ssl-certs/keycloak.crt and keycloak.key)
+    cert_source_dir: "{{ playbook_dir }}/keycloak-ssl-certs"
+    db_host: "10.0.2.20"
+    db_port: "5432"
+    db_name: "keycloak"
+    db_user: "keycloak"
+    db_password: "keycloak_123"
+    keycloak_admin_user: "anandy"
+    keycloak_admin_password: "welcome"
+
+  tasks:
+    - name: Update system packages
+      apt:
+        update_cache: yes
+        upgrade: yes
+
+    - name: Install Java 17 (required by Keycloak {{ keycloak_version }})
+      apt:
+        name: openjdk-17-jdk
+        state: present
+
+    - name: Create keycloak group
+      group:
+        name: "{{ keycloak_group }}"
+        state: present
+
+    - name: Create keycloak user
+      user:
+        name: "{{ keycloak_user }}"
+        group: "{{ keycloak_group }}"
+        home: "{{ keycloak_home }}"
+        shell: /bin/bash
+        system: yes
+
+    - name: Download Keycloak
+      get_url:
+        url: "https://github.com/keycloak/keycloak/releases/download/{{ keycloak_version }}/keycloak-{{ keycloak_version }}.tar.gz"
+        dest: "/tmp/keycloak-{{ keycloak_version }}.tar.gz"
+        mode: '0644'
+
+    - name: Extract Keycloak
+      unarchive:
+        src: "/tmp/keycloak-{{ keycloak_version }}.tar.gz"
+        dest: "/opt"
+        remote_src: yes
+        owner: "{{ keycloak_user }}"
+        group: "{{ keycloak_group }}"
+      args:
+        creates: "/opt/keycloak-{{ keycloak_version }}"
+
+    - name: Check if keycloak_home exists
+      stat:
+        path: "{{ keycloak_home }}"
+      register: keycloak_home_stat
+
+    - name: Check if keycloak_home directory is empty
+      find:
+        paths: "{{ keycloak_home }}"
+        file_type: any
+        hidden: yes
+        recurse: no
+      when: keycloak_home_stat.stat.isdir is defined and keycloak_home_stat.stat.isdir
+      register: keycloak_home_find
+
+    - name: Create symlink
+      file:
+        src: "/opt/keycloak-{{ keycloak_version }}"
+        dest: "{{ keycloak_home }}"
+        state: link
+        owner: "{{ keycloak_user }}"
+        group: "{{ keycloak_group }}"
+        force: yes
+      when:
+        - not keycloak_home_stat.stat.exists | default(false)
+        - keycloak_home_stat.stat.islnk | default(false) or (keycloak_home_stat.stat.isdir | default(false) and (keycloak_home_find.matched | default(0)) == 0)
+
+    - name: Check for kc.sh in keycloak_home
+      stat:
+        path: "{{ keycloak_home }}/bin/kc.sh"
+      register: kc_sh_stat
+
+    - name: Use versioned directory as keycloak_home when kc.sh missing
+      set_fact:
+        keycloak_home: "/opt/keycloak-{{ keycloak_version }}"
+      when: not kc_sh_stat.stat.exists | default(false)
+
+    - name: Create SSL certificate directory
+      file:
+        path: "{{ keycloak_home }}/conf/ssl"
+        state: directory
+        owner: "{{ keycloak_user }}"
+        group: "{{ keycloak_group }}"
+        mode: '0750'
+
+    - name: Copy SSL certificates
+      copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        owner: "{{ keycloak_user }}"
+        group: "{{ keycloak_group }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { src: "{{ cert_source_dir }}/keycloak.crt", dest: "{{ keycloak_home }}/conf/ssl/keycloak.crt", mode: "0644" }
+        - { src: "{{ cert_source_dir }}/keycloak.key", dest: "{{ keycloak_home }}/conf/ssl/keycloak.key", mode: "0600" }
+
+    - name: Configure Keycloak
+      template:
+        src: keycloak.conf.j2
+        dest: "{{ keycloak_home }}/conf/keycloak.conf"
+        owner: "{{ keycloak_user }}"
+        group: "{{ keycloak_group }}"
+        mode: '0640'
+
+    - name: Create systemd service file
+      template:
+        src: keycloak.service.j2
+        dest: /etc/systemd/system/keycloak.service
+        mode: '0644'
+      notify: reload systemd
+
+    - name: Build Keycloak
+      command: "{{ keycloak_home }}/bin/kc.sh build"
+      become: yes
+
+    - name: Ensure Keycloak directory ownership
+      file:
+        path: "{{ keycloak_home }}"
+        state: directory
+        owner: "{{ keycloak_user }}"
+        group: "{{ keycloak_group }}"
+        recurse: yes
+
+    - name: Start and enable Keycloak service
+      systemd:
+        name: keycloak
+        state: started
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Wait for Keycloak to start
+      wait_for:
+        port: 8443
+        host: "127.0.0.1"
+        delay: 30
+        timeout: 300
+      delegate_to: "{{ inventory_hostname }}"
+
+  handlers:
+    - name: reload systemd
+      systemd:
+        daemon_reload: yes

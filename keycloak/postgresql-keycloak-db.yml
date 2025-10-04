@@ -1,0 +1,103 @@
+---
+- name: Setup PostgreSQL database for Keycloak
+  hosts: localhost
+  become: no
+  vars:
+    postgres_host: "10.0.2.20"
+    postgres_port: "5432"
+    postgres_admin_user: "postgres"
+    postgres_admin_password: "postgres_password"
+    
+    # Keycloak database configuration
+    keycloak_db_name: "keycloak"
+    keycloak_db_user: "keycloak"
+    keycloak_db_password: "keycloak_123"
+
+  tasks:
+    - name: Install psycopg2 for PostgreSQL operations
+      pip:
+        name: psycopg2-binary
+        state: present
+
+    - name: Create Keycloak database
+      postgresql_db:
+        name: "{{ keycloak_db_name }}"
+        login_host: "{{ postgres_host }}"
+        login_port: "{{ postgres_port }}"
+        login_user: "{{ postgres_admin_user }}"
+        login_password: "{{ postgres_admin_password }}"
+        encoding: 'UTF-8'
+        lc_collate: 'en_US.UTF-8'
+        lc_ctype: 'en_US.UTF-8'
+        template: 'template0'
+        state: present
+
+    - name: Create Keycloak database user
+      postgresql_user:
+        name: "{{ keycloak_db_user }}"
+        password: "{{ keycloak_db_password }}"
+        login_host: "{{ postgres_host }}"
+        login_port: "{{ postgres_port }}"
+        login_user: "{{ postgres_admin_user }}"
+        login_password: "{{ postgres_admin_password }}"
+        encrypted: yes
+        state: present
+
+    - name: Grant all privileges on Keycloak database to user
+      postgresql_privs:
+        database: "{{ keycloak_db_name }}"
+        state: present
+        privs: ALL
+        type: database
+        obj: "{{ keycloak_db_name }}"
+        role: "{{ keycloak_db_user }}"
+        login_host: "{{ postgres_host }}"
+        login_port: "{{ postgres_port }}"
+        login_user: "{{ postgres_admin_user }}"
+        login_password: "{{ postgres_admin_password }}"
+
+    - name: Grant schema creation privileges to Keycloak user
+      postgresql_privs:
+        database: "{{ keycloak_db_name }}"
+        state: present
+        privs: CREATE
+        type: database
+        obj: "{{ keycloak_db_name }}"
+        role: "{{ keycloak_db_user }}"
+        login_host: "{{ postgres_host }}"
+        login_port: "{{ postgres_port }}"
+        login_user: "{{ postgres_admin_user }}"
+        login_password: "{{ postgres_admin_password }}"
+
+    - name: Grant USAGE and CREATE on public schema to Keycloak user
+      postgresql_privs:
+        database: "{{ keycloak_db_name }}"
+        state: present
+        type: schema
+        objs: public
+        privs: USAGE,CREATE
+        role: "{{ keycloak_db_user }}"
+        login_host: "{{ postgres_host }}"
+        login_port: "{{ postgres_port }}"
+        login_user: "{{ postgres_admin_user }}"
+        login_password: "{{ postgres_admin_password }}"
+
+    - name: Test database connection
+      postgresql_query:
+        db: "{{ keycloak_db_name }}"
+        login_host: "{{ postgres_host }}"
+        login_port: "{{ postgres_port }}"
+        login_user: "{{ keycloak_db_user }}"
+        login_password: "{{ keycloak_db_password }}"
+        query: "SELECT version();"
+      register: db_test
+
+    - name: Display database setup results
+      debug:
+        msg: |
+          ✅ PostgreSQL Database Setup Complete:
+          - Database: {{ keycloak_db_name }}
+          - User: {{ keycloak_db_user }}
+          - Host: {{ postgres_host }}:{{ postgres_port }}
+          - Connection test: {{ 'SUCCESS' if db_test.rowcount is defined else 'FAILED' }}
+          - PostgreSQL version: {{ db_test.query_result[0].version if db_test.query_result is defined else 'Unknown' }}
