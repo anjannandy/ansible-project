@@ -1,0 +1,83 @@
+---
+- name: Setup PostgreSQL database and user with privileges
+  hosts: localhost
+  become: no
+  vars:
+    postgres_host: "{{ postgres_host | default('localhost') }}"
+    postgres_port: 5432
+    postgres_admin_user: "postgres"
+    postgres_admin_password: "{{ postgres_admin_password | default('postgres_password') }}"
+    db_name: "{{ db_name | default('example_db') }}"
+    db_user: "{{ db_user | default('example_user') }}"
+    db_password: "{{ db_password | default('example_password') }}"
+  tasks:
+    - name: Install psycopg2 for PostgreSQL operations
+      pip:
+        name: psycopg2-binary
+        state: present
+
+    - name: Create database
+      postgresql_db:
+        name: "{{ db_name }}"
+        login_host: "{{ postgres_host }}"
+        login_port: "{{ postgres_port }}"
+        login_user: "{{ postgres_admin_user }}"
+        login_password: "{{ postgres_admin_password }}"
+        state: present
+
+    - name: Create database user
+      postgresql_user:
+        name: "{{ db_user }}"
+        password: "{{ db_password }}"
+        login_host: "{{ postgres_host }}"
+        login_port: "{{ postgres_port }}"
+        login_user: "{{ postgres_admin_user }}"
+        login_password: "{{ postgres_admin_password }}"
+        encrypted: yes
+        state: present
+
+    - name: Grant all privileges on database to user
+      postgresql_privs:
+        database: "{{ db_name }}"
+        state: present
+        privs: ALL
+        type: database
+        obj: "{{ db_name }}"
+        role: "{{ db_user }}"
+        login_host: "{{ postgres_host }}"
+        login_port: "{{ postgres_port }}"
+        login_user: "{{ postgres_admin_user }}"
+        login_password: "{{ postgres_admin_password }}"
+
+    - name: Grant USAGE and CREATE privileges on public schema to user
+      postgresql_privs:
+        database: "{{ db_name }}"
+        state: present
+        type: schema
+        objs: public
+        privs: USAGE,CREATE
+        role: "{{ db_user }}"
+        login_host: "{{ postgres_host }}"
+        login_port: "{{ postgres_port }}"
+        login_user: "{{ postgres_admin_user }}"
+        login_password: "{{ postgres_admin_password }}"
+
+    - name: Test database connection
+      postgresql_query:
+        db: "{{ db_name }}"
+        login_host: "{{ postgres_host }}"
+        login_port: "{{ postgres_port }}"
+        login_user: "{{ db_user }}"
+        login_password: "{{ db_password }}"
+        query: "SELECT version();"
+      register: db_test
+
+    - name: Display database setup results
+      debug:
+        msg: |
+          ✅ PostgreSQL Database Setup Complete:
+          - Database: {{ db_name }}
+          - User: {{ db_user }}
+          - Host: {{ postgres_host }}:{{ postgres_port }}
+          - Connection test: {{ 'SUCCESS' if db_test.rowcount is defined else 'FAILED' }}
+          - PostgreSQL version: {{ db_test.query_result[0].version if db_test.query_result is defined else 'Unknown' }}
