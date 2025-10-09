@@ -98,6 +98,11 @@ kubectl create configmap ceph-csi-encryption-kms-config -n kube-system
     imageFeatures: layering
     csi.storage.k8s.io/provisioner-secret-name: csi-ceph-secret
     csi.storage.k8s.io/provisioner-secret-namespace: kube-system
+    # Also set controller delete/expand secrets to avoid "provided secret is empty" on DeleteVolume/ExpandVolume
+    csi.storage.k8s.io/controller-delete-secret-name: csi-ceph-secret
+    csi.storage.k8s.io/controller-delete-secret-namespace: kube-system
+    csi.storage.k8s.io/controller-expand-secret-name: csi-ceph-secret
+    csi.storage.k8s.io/controller-expand-secret-namespace: kube-system
     csi.storage.k8s.io/node-stage-secret-name: csi-ceph-secret
     csi.storage.k8s.io/node-stage-secret-namespace: kube-system
     fsType: ext4

@@ -1,0 +1,41 @@
+# Helm values for CephFS CSI driver
+# Tell Helm to use externally managed configmap
+externallyManagedConfigmap: true
+
+configMap:
+  enable: true
+  name: ceph-csi-config
+
+# Use externally created secret
+secrets:
+  enable: true
+  name: csi-cephfs-secret
+
+provisioner:
+  name: provisioner
+  replicaCount: 3
+  secret:
+    create: false
+    name: csi-cephfs-secret
+    mountPath: /etc/ceph-csi-secret
+  configMap:
+    name: ceph-csi-config
+
+nodeplugin:
+  name: nodeplugin
+  secret:
+    create: false
+    name: csi-cephfs-secret
+    mountPath: /etc/ceph-csi-secret
+  configMap:
+    name: ceph-csi-config
+
+# Storage class configuration
+storageClass:
+  create: false
+  name: csi-cephfs-sc
+  clusterID: 8a8c14c8-f022-48bd-96f8-892cddb2dc43
+  fsName: cephfs
+  pool: cephfs_data
+  reclaimPolicy: Delete
+  allowVolumeExpansion: true
