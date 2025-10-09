@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ceph-debug
+  namespace: ceph-csi-rbd
+spec:
+  restartPolicy: Never
+  containers:
+  - name: ceph-tools
+    image: quay.io/ceph/ceph:v20.1.1
+    command: ["/bin/sh", "-c", "sleep 3600"]
+    volumeMounts:
+      - name: ceph-secret
+        mountPath: /etc/ceph-csi-secret
+        readOnly: true
+  volumes:
+    - name: ceph-secret
+      secret:
+        secretName: csi-rbd-secret

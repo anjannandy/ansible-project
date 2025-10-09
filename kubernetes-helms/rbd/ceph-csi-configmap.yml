@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ceph-csi-config
+  namespace: ceph-csi-rbd
+  labels:
+    app.kubernetes.io/managed-by: Helm
+    app: ceph-csi-rbd
+    chart: ceph-csi-rbd-3.7.2
+    component: nodeplugin
+    heritage: Helm
+    release: ceph-csi-rbd
+  annotations:
+    meta.helm.sh/release-name: ceph-csi-rbd
+    meta.helm.sh/release-namespace: ceph-csi-rbd
+data:
+  config.json: |
+    [
+      {
+        "clusterID": "8a8c14c8-f022-48bd-96f8-892cddb2dc43",
+        "monitors": [
+          "10.0.0.4:6789",
+          "10.0.0.5:6789",
+          "10.0.0.6:6789"
+        ]
+      }
+    ]

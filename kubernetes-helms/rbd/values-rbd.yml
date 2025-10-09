@@ -1,0 +1,27 @@
+# Tell Helm to create & populate ceph-csi-config for you
+externallyManagedConfigmap: true
+
+configMap:
+  enable: true
+  name: ceph-csi-config
+
+# secret sections unchanged…
+secrets:
+  enable: true
+  name: csi-rbd-secret
+
+provisioner:
+  secret:
+    create: false
+    name: csi-rbd-secret
+    mountPath: /etc/ceph-csi-secret
+  configMap:
+    name: ceph-csi-config
+
+nodeplugin:
+  secret:
+    create: false
+    name: csi-rbd-secret
+    mountPath: /etc/ceph-csi-secret
+  configMap:
+    name: ceph-csi-config
