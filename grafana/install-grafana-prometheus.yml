@@ -1,0 +1,385 @@
+---
+- name: Install Grafana and Prometheus with SSL certificates
+  hosts: grafana_server
+  become: yes
+  vars:
+    grafana_version: "latest"
+    prometheus_version: "2.45.0"
+    node_exporter_version: "1.6.1"
+
+    # SSL certificate paths (local)
+    local_cert_dir: "./certs"
+
+    # SSL certificate paths (remote)
+    ssl_cert_dir: "/etc/ssl/grafana"
+    grafana_cert_file: "{{ ssl_cert_dir }}/multi-domain-fullchain.pem"
+    grafana_key_file: "{{ ssl_cert_dir }}/multi-domain-key.pem"
+
+    # Grafana configuration
+    grafana_port: 3000
+    grafana_domain: "grafana.homelab.com"
+    grafana_admin_user: "admin"
+    grafana_admin_password: "admin123"  # Change this!
+
+    # Prometheus configuration
+    prometheus_port: 9090
+    prometheus_data_dir: "/var/lib/prometheus"
+    prometheus_config_dir: "/etc/prometheus"
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      tags: ['setup']
+
+    - name: Install required packages
+      apt:
+        name:
+          - apt-transport-https
+          - software-properties-common
+          - wget
+          - curl
+          - gnupg
+          - tar
+          - adduser
+          - libfontconfig1
+        state: present
+      tags: ['setup']
+
+    # SSL Certificates Setup
+    - name: Create SSL certificate directory
+      file:
+        path: "{{ ssl_cert_dir }}"
+        state: directory
+        mode: '0755'
+      tags: ['ssl']
+
+    - name: Copy SSL certificates to server
+      copy:
+        src: "{{ local_cert_dir }}/{{ item }}"
+        dest: "{{ ssl_cert_dir }}/{{ item }}"
+        mode: "{{ '0600' if 'key' in item else '0644' }}"
+      loop:
+        - multi-domain-cert.pem
+        - multi-domain-key.pem
+        - multi-domain-ca.pem
+        - multi-domain-fullchain.pem
+        - multi-domain-bundle.pem
+      tags: ['ssl']
+
+    - name: Verify certificate files exist
+      stat:
+        path: "{{ ssl_cert_dir }}/{{ item }}"
+      loop:
+        - multi-domain-fullchain.pem
+        - multi-domain-key.pem
+      register: cert_files
+      tags: ['ssl']
+
+    - name: Fail if certificates are missing
+      fail:
+        msg: "Certificate file {{ item.item }} is missing!"
+      when: not item.stat.exists
+      loop: "{{ cert_files.results }}"
+      tags: ['ssl']
+
+    - name: Install Vault CA certificate as trusted root CA
+      copy:
+        src: "{{ local_cert_dir }}/multi-domain-ca.pem"
+        dest: /usr/local/share/ca-certificates/vault-ca.crt
+        mode: '0644'
+      tags: ['ssl']
+
+    - name: Update system CA trust store
+      command: update-ca-certificates
+      tags: ['ssl']
+
+    # Install Grafana
+    - name: Add Grafana GPG key
+      apt_key:
+        url: https://apt.grafana.com/gpg.key
+        state: present
+      tags: ['grafana']
+
+    - name: Add Grafana repository
+      apt_repository:
+        repo: "deb https://apt.grafana.com stable main"
+        state: present
+        filename: grafana
+      tags: ['grafana']
+
+    - name: Install Grafana
+      apt:
+        name: grafana
+        state: present
+        update_cache: yes
+      tags: ['grafana']
+
+    - name: Configure Grafana for HTTPS
+      template:
+        src: grafana.ini.j2
+        dest: /etc/grafana/grafana.ini
+        owner: root
+        group: grafana
+        mode: '0640'
+      notify: restart grafana
+      tags: ['grafana', 'config']
+
+    - name: Start and enable Grafana service
+      systemd:
+        name: grafana-server
+        state: started
+        enabled: yes
+        daemon_reload: yes
+      tags: ['grafana']
+
+    # Install Prometheus
+    - name: Create Prometheus system user
+      user:
+        name: prometheus
+        system: yes
+        shell: /bin/false
+        create_home: no
+      tags: ['prometheus']
+
+    - name: Create Prometheus directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: prometheus
+        group: prometheus
+        mode: '0755'
+      loop:
+        - "{{ prometheus_config_dir }}"
+        - "{{ prometheus_config_dir }}/rules"
+        - "{{ prometheus_config_dir }}/file_sd"
+        - "{{ prometheus_data_dir }}"
+      tags: ['prometheus']
+
+    - name: Download Prometheus
+      get_url:
+        url: "https://github.com/prometheus/prometheus/releases/download/v{{ prometheus_version }}/prometheus-{{ prometheus_version }}.linux-amd64.tar.gz"
+        dest: "/tmp/prometheus-{{ prometheus_version }}.tar.gz"
+        mode: '0644'
+      tags: ['prometheus']
+
+    - name: Extract Prometheus
+      unarchive:
+        src: "/tmp/prometheus-{{ prometheus_version }}.tar.gz"
+        dest: /tmp/
+        remote_src: yes
+      tags: ['prometheus']
+
+    - name: Copy Prometheus binaries
+      copy:
+        src: "/tmp/prometheus-{{ prometheus_version }}.linux-amd64/{{ item }}"
+        dest: "/usr/local/bin/{{ item }}"
+        owner: prometheus
+        group: prometheus
+        mode: '0755'
+        remote_src: yes
+      loop:
+        - prometheus
+        - promtool
+      tags: ['prometheus']
+
+    - name: Copy Prometheus console files
+      copy:
+        src: "/tmp/prometheus-{{ prometheus_version }}.linux-amd64/{{ item }}"
+        dest: "{{ prometheus_config_dir }}/{{ item }}"
+        owner: prometheus
+        group: prometheus
+        mode: '0755'
+        remote_src: yes
+      loop:
+        - consoles
+        - console_libraries
+      tags: ['prometheus']
+
+    - name: Create Prometheus configuration
+      template:
+        src: prometheus.yml.j2
+        dest: "{{ prometheus_config_dir }}/prometheus.yml"
+        owner: prometheus
+        group: prometheus
+        mode: '0644'
+      notify: restart prometheus
+      tags: ['prometheus', 'config']
+
+    - name: Create Prometheus web config for HTTPS
+      template:
+        src: prometheus-web-config.yml.j2
+        dest: "{{ prometheus_config_dir }}/web-config.yml"
+        owner: prometheus
+        group: prometheus
+        mode: '0644'
+      notify: restart prometheus
+      tags: ['prometheus', 'config']
+
+    - name: Create Prometheus systemd service
+      template:
+        src: prometheus.service.j2
+        dest: /etc/systemd/system/prometheus.service
+        mode: '0644'
+      notify: restart prometheus
+      tags: ['prometheus']
+
+    - name: Start and enable Prometheus service
+      systemd:
+        name: prometheus
+        state: started
+        enabled: yes
+        daemon_reload: yes
+      tags: ['prometheus']
+
+    # Install Node Exporter
+    - name: Create node_exporter system user
+      user:
+        name: node_exporter
+        system: yes
+        shell: /bin/false
+        create_home: no
+      tags: ['node_exporter']
+
+    - name: Download Node Exporter
+      get_url:
+        url: "https://github.com/prometheus/node_exporter/releases/download/v{{ node_exporter_version }}/node_exporter-{{ node_exporter_version }}.linux-amd64.tar.gz"
+        dest: "/tmp/node_exporter-{{ node_exporter_version }}.tar.gz"
+        mode: '0644'
+      tags: ['node_exporter']
+
+    - name: Extract Node Exporter
+      unarchive:
+        src: "/tmp/node_exporter-{{ node_exporter_version }}.tar.gz"
+        dest: /tmp/
+        remote_src: yes
+      tags: ['node_exporter']
+
+    - name: Copy Node Exporter binary
+      copy:
+        src: "/tmp/node_exporter-{{ node_exporter_version }}.linux-amd64/node_exporter"
+        dest: /usr/local/bin/node_exporter
+        owner: node_exporter
+        group: node_exporter
+        mode: '0755'
+        remote_src: yes
+      tags: ['node_exporter']
+
+    - name: Create Node Exporter config directory
+      file:
+        path: /etc/node_exporter
+        state: directory
+        owner: node_exporter
+        group: node_exporter
+        mode: '0755'
+      tags: ['node_exporter']
+
+    - name: Create Node Exporter web config for HTTPS
+      template:
+        src: node_exporter-web-config.yml.j2
+        dest: /etc/node_exporter/web-config.yml
+        owner: node_exporter
+        group: node_exporter
+        mode: '0644'
+      notify: restart node_exporter
+      tags: ['node_exporter', 'config']
+
+    - name: Create Node Exporter systemd service
+      template:
+        src: node_exporter.service.j2
+        dest: /etc/systemd/system/node_exporter.service
+        mode: '0644'
+      notify: restart node_exporter
+      tags: ['node_exporter']
+
+    - name: Start and enable Node Exporter service
+      systemd:
+        name: node_exporter
+        state: started
+        enabled: yes
+        daemon_reload: yes
+      tags: ['node_exporter']
+
+    # Firewall configuration (if ufw is installed)
+    - name: Check if UFW is installed
+      command: which ufw
+      register: ufw_check
+      failed_when: false
+      changed_when: false
+      tags: ['firewall']
+
+    - name: Allow Grafana HTTPS port
+      ufw:
+        rule: allow
+        port: "{{ grafana_port }}"
+        proto: tcp
+      when: ufw_check.rc == 0
+      tags: ['firewall']
+
+    - name: Allow Prometheus port
+      ufw:
+        rule: allow
+        port: "{{ prometheus_port }}"
+        proto: tcp
+      when: ufw_check.rc == 0
+      tags: ['firewall']
+
+    - name: Allow Node Exporter port
+      ufw:
+        rule: allow
+        port: "9100"
+        proto: tcp
+      when: ufw_check.rc == 0
+      tags: ['firewall']
+
+  handlers:
+    - name: restart grafana
+      systemd:
+        name: grafana-server
+        state: restarted
+
+    - name: restart prometheus
+      systemd:
+        name: prometheus
+        state: restarted
+
+    - name: restart node_exporter
+      systemd:
+        name: node_exporter
+        state: restarted
+
+  post_tasks:
+    - name: Display installation summary
+      debug:
+        msg: |
+          ========================================
+          Installation Complete!
+          ========================================
+          
+          Grafana:
+          - URL: https://{{ grafana_domain }}:{{ grafana_port }}
+          - Username: {{ grafana_admin_user }}
+          - Password: {{ grafana_admin_password }}
+          - SSL Cert: {{ grafana_cert_file }}
+          - SSL Key: {{ grafana_key_file }}
+          
+          Prometheus:
+          - URL: http://{{ ansible_default_ipv4.address }}:{{ prometheus_port }}
+          - Config: {{ prometheus_config_dir }}/prometheus.yml
+          - Data: {{ prometheus_data_dir }}
+          
+          Node Exporter:
+          - URL: http://{{ ansible_default_ipv4.address }}:9100/metrics
+          
+          Next Steps:
+          1. Access Grafana: https://grafana.homelab.com:3000
+          2. Login with admin/{{ grafana_admin_password }}
+          3. Change admin password immediately!
+          4. Add Prometheus data source: http://localhost:9090
+          5. Import dashboards from https://grafana.com/grafana/dashboards/
+          
+          Status:
+          - sudo systemctl status grafana-server
+          - sudo systemctl status prometheus
+          - sudo systemctl status node_exporter

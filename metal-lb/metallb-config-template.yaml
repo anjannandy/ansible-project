@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  namespace: metallb-system
+  name: config
+data:
+  # Replace the addresses below with the IPs you want MetalLB to hand out as LoadBalancer IPs.
+  # You can list single IPs or ranges. Example single IPs:
+  #   addresses:
+  #     - 10.0.1.10
+  #     - 10.0.1.11
+  # Example range:
+  #     - 10.0.1.100-10.0.1.120
+  # If you want to use your worker node IPs, either use the provided generate-config.sh to auto-generate
+  # this file from the cluster nodes, or replace the addresses section manually.
+  config: |
+    address-pools:
+    - name: default
+      protocol: layer2
+      addresses:
+      - 10.0.1.1-10.0.1.4
+

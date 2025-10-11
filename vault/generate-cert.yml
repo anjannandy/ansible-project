@@ -256,7 +256,12 @@
             content: "{{ multi_cert_response.json.data.issuing_ca }}", 
             mode: "0644" 
           }
-      when: 
+        - {
+            name: "multi-domain-fullchain.pem",
+            content: "{{ multi_cert_response.json.data.certificate }}\n{{ multi_cert_response.json.data.ca_chain | join('\n') }}",
+            mode: "0644"
+          }
+      when:
         - multi_cert_response.status == 200
         - multi_cert_response.json is defined
         - multi_cert_response.json.data is defined

@@ -45,3 +45,8 @@ The script will create files like:
 - `myserver-ca.pem` (CA certificate)
 - `myserver-bundle.pem` (certificate + CA bundle)
 - `myserver-info.txt` (certificate information)
+
+
+ansible-playbook generate-cert.yml --tags "generate,save-files" \
+  -e cert_hostname="api.local" -e cert_ip="10.0.1.50" \
+  -e cert_output_dir="./api-certs" -e vault_root_token="TOKEN"

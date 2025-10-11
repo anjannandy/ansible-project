@@ -1,0 +1,19 @@
+[Unit]
+Description=Node Exporter
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=node_exporter
+Group=node_exporter
+Type=simple
+ExecStart=/usr/local/bin/node_exporter \
+  --collector.filesystem.mount-points-exclude='^/(sys|proc|dev|host|etc)($$|/)' \
+  --web.listen-address=:9100 \
+  --web.config.file=/etc/node_exporter/web-config.yml
+
+Restart=always
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target
